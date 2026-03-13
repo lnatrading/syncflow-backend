@@ -279,7 +279,7 @@ async function runSupplierSync(supabase, supplier) {
           title:       `Odoo push: ${odooBatchErrors} batch(es) failed`,
           detail:      `${odooBatchErrors} of ${Math.ceil(toExport.length / ODOO_CHUNK)} batches failed after 3 retries for ${supplier.name}. Products in failed batches were NOT updated in Odoo. Will retry on next sync.`,
           supplier_id: supplier.id,
-        }).catch(() => {});
+        });
       }
     }
 

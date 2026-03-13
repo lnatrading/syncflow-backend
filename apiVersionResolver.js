@@ -13,8 +13,7 @@ async function getActiveVersion(supabase, supplierId) {
     .select('*')
     .eq('supplier_id', supplierId)
     .eq('is_active', true)
-    .single()
-    .catch(() => ({ data: null }));
+    .single();
   return data || null;
 }
 

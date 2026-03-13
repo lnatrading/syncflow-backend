@@ -151,7 +151,7 @@ async function ensureCustomFields(config, uid, supabase = null) {
           type:   'odoo_warning',
           title:  'Odoo custom fields missing',
           detail: msg,
-        }).catch(() => {});
+        });
       }
     }
     _customFieldsVerified = true;
