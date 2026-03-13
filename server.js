@@ -22,7 +22,12 @@ const supabase = createClient(
   process.env.SUPABASE_SERVICE_KEY
 );
 
-app.use(cors({ origin: '*' }));
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'x-api-key'],
+}));
+app.options('*', cors()); // handle preflight requests for all routes
 app.use(express.json());
 
 // ── Attach supabase to every request ───────────────────────
