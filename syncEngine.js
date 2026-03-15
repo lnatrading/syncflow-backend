@@ -141,28 +141,22 @@ async function runSupplierSync(supabase, supplier) {
           for (const [k,v] of Object.entries(catCounts)) catCountsLower[k.toLowerCase()] = v;
           console.log(`[SYNC] Category counts sample: ${JSON.stringify(Object.entries(catCounts).slice(0,5))}`);
 
-          // Build update rows for all categories in one bulk upsert
-          const updateRows = existingCats.map(cat => {
-            // Match ClassCode to category name/external_id (top-level classes)
-            const count = catCounts[cat.name] || catCounts[cat.external_id]
-                       || catCountsLower[cat.name?.toLowerCase()] || catCountsLower[cat.external_id?.toLowerCase()]
-                       || 0;
-            return { ...cat, product_count: count };
-          });
-
-          const withCounts = updateRows.filter(r => r.product_count > 0);
-          const withZero   = updateRows.filter(r => r.product_count === 0);
-
-          // Bulk update non-zero first, then zero-out the rest
-          if (withCounts.length) {
-            await supabase.from('supplier_categories')
-              .upsert(withCounts, { onConflict: 'supplier_id,path', ignoreDuplicates: false });
+          // Update only product_count — use individual updates to avoid overwriting my_category_id mappings
+          // Batch into groups of 50 to avoid too many sequential calls
+          let updated = 0;
+          const BATCH = 50;
+          for (let i = 0; i < existingCats.length; i += BATCH) {
+            const batch = existingCats.slice(i, i + BATCH);
+            await Promise.all(batch.map(cat => {
+              const count = catCounts[cat.name] || catCounts[cat.external_id]
+                         || catCountsLower[cat.name?.toLowerCase()] || catCountsLower[cat.external_id?.toLowerCase()]
+                         || 0;
+              if (count > 0) updated++;
+              return supabase.from('supplier_categories')
+                .update({ product_count: count }).eq('id', cat.id);
+            }));
           }
-          if (withZero.length) {
-            await supabase.from('supplier_categories')
-              .upsert(withZero, { onConflict: 'supplier_id,path', ignoreDuplicates: false });
-          }
-          console.log(`[SYNC] Category counts updated: ${withCounts.length}/${existingCats.length} categories got product counts`);
+          console.log(`[SYNC] Category counts updated: ${updated}/${existingCats.length} categories got product counts`);
         }
       } catch(e) { console.warn('[SYNC] Category count update failed:', e.message); }
     }
