@@ -127,42 +127,6 @@ async function runSupplierSync(supabase, supplier) {
       console.warn('[SYNC] Attribute discovery failed:', e.message)
     );
 
-    // 6a-2. Update category product counts based on normalised products
-    // TD Baltic ClassCode (e.g. "UPS") matches category external_id and name
-    if (normalised.length > 0) {
-      try {
-        const catCounts = {};
-        for (const p of normalised) {
-          if (p.category) catCounts[p.category] = (catCounts[p.category] || 0) + 1;
-        }
-        // Fetch existing categories for this supplier to match by name/external_id
-        const { data: existingCats } = await supabase.from('supplier_categories')
-          .select('id, name, external_id, path').eq('supplier_id', supplier.id);
-        if (existingCats) {
-          const catCountsLower = {};
-          for (const [k,v] of Object.entries(catCounts)) catCountsLower[k.toLowerCase()] = v;
-          console.log(`[SYNC] Category counts sample: ${JSON.stringify(Object.entries(catCounts).slice(0,5))}`);
-
-          // Update only product_count — use individual updates to avoid overwriting my_category_id mappings
-          // Batch into groups of 50 to avoid too many sequential calls
-          let updated = 0;
-          const BATCH = 50;
-          for (let i = 0; i < existingCats.length; i += BATCH) {
-            const batch = existingCats.slice(i, i + BATCH);
-            await Promise.all(batch.map(cat => {
-              const count = catCounts[cat.name] || catCounts[cat.external_id]
-                         || catCountsLower[cat.name?.toLowerCase()] || catCountsLower[cat.external_id?.toLowerCase()]
-                         || 0;
-              if (count > 0) updated++;
-              return supabase.from('supplier_categories')
-                .update({ product_count: count }).eq('id', cat.id);
-            }));
-          }
-          console.log(`[SYNC] Category counts updated: ${updated}/${existingCats.length} categories got product counts`);
-        }
-      } catch(e) { console.warn('[SYNC] Category count update failed:', e.message); }
-    }
-
     // 6b. Discover & upsert supplier categories from the categories endpoint
     if (categoriesEndpoint) {
       try {
@@ -189,6 +153,36 @@ async function runSupplierSync(supabase, supplier) {
       } catch(e) {
         console.warn('[SYNC] Categories fetch failed:', e.message);
       }
+    }
+
+    // 6c. Update category product counts — runs AFTER discoverCategories to avoid being overwritten
+    if (normalised.length > 0) {
+      try {
+        const catCounts = {};
+        for (const p of normalised) {
+          if (p.category) catCounts[p.category] = (catCounts[p.category] || 0) + 1;
+        }
+        const { data: existingCats } = await supabase.from('supplier_categories')
+          .select('id, name, external_id').eq('supplier_id', supplier.id);
+        if (existingCats) {
+          const catCountsLower = {};
+          for (const [k,v] of Object.entries(catCounts)) catCountsLower[k.toLowerCase()] = v;
+          let updated = 0;
+          const BATCH = 50;
+          for (let i = 0; i < existingCats.length; i += BATCH) {
+            const batch = existingCats.slice(i, i + BATCH);
+            await Promise.all(batch.map(cat => {
+              const count = catCounts[cat.name] || catCounts[cat.external_id]
+                         || catCountsLower[cat.name?.toLowerCase()] || catCountsLower[cat.external_id?.toLowerCase()]
+                         || 0;
+              if (count > 0) updated++;
+              return supabase.from('supplier_categories')
+                .update({ product_count: count }).eq('id', cat.id);
+            }));
+          }
+          console.log(`[SYNC] Category counts updated: ${updated}/${existingCats.length} with product counts`);
+        }
+      } catch(e) { console.warn('[SYNC] Category count update failed:', e.message); }
     }
 
     // 7. Fetch parameterised endpoints (e.g. Elko per-product description URLs).
@@ -1075,15 +1069,16 @@ async function discoverCategories(supabase, supplierId, rawCategories) {
   if (!flat.length) return;
 
   const rows = flat.map(c => ({
-    supplier_id:   supplierId,
-    external_id:   c.external_id,
-    path:          c.path,
-    name:          c.name,
-    product_count: 0,
+    supplier_id: supplierId,
+    external_id: c.external_id,
+    path:        c.path,
+    name:        c.name,
+    // product_count intentionally omitted — updated separately after sync
+    // ignoreDuplicates: true ensures existing counts are never overwritten
   }));
 
   await supabase.from('supplier_categories')
-    .upsert(rows, { onConflict: 'supplier_id,path', ignoreDuplicates: false });
+    .upsert(rows, { onConflict: 'supplier_id,path', ignoreDuplicates: true });
 }
 
 module.exports = { runSupplierSync };
