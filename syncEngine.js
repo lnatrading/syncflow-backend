@@ -109,8 +109,9 @@ async function runSupplierSync(supabase, supplier) {
       .eq('supplier_id', supplier.id).eq('active', true);
     const { data: markupRules }   = await supabase.from('markup_rules').select('*')
       .eq('supplier_id', supplier.id);
-    const { data: shippingTiers } = await supabase.from('shipping_tiers').select('*')
-      .eq('supplier_id', supplier.id).order('sort_order');
+    const { data: _shippingRaw } = await supabase.from('shipping_tiers').select('*')
+      .eq('supplier_id', supplier.id).order('priority');
+    const shippingTiers = _shippingRaw || [];
 
     // 6. Normalise all products
     let normalised = rawProducts.map(raw =>
