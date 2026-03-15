@@ -266,7 +266,8 @@ async function runSupplierSync(supabase, supplier) {
         images_all:  product.images_all   || null,
         subcategory: product.subcategory  || null,
         specs:       product.specs        || null,
-        shipping_cost: product.shipping_cost || null,
+        shipping_cost:  product.shipping_cost  || null,
+        shipping_class: product.shipping_class || null,
         status:      product.stock_qty <= 0 ? 'unavailable' : product.stock_qty <= 5 ? 'low' : 'active',
         last_synced: new Date(),
       }));
@@ -824,33 +825,65 @@ function extractDimensions(specs) {
   return { weightKg, lengthCm, widthCm, heightCm, volWeightKg, longestSideCm };
 }
 
-// Apply shipping tiers to a product — returns shipping cost in EUR
-// Tier matching: use the HIGHER of actual weight and volumetric weight (billable weight)
-function applyShippingTiers(dims, tiers) {
-  if (!dims || !tiers || !tiers.length) return 0;
-
-  const billableWeight = Math.max(dims.weightKg || 0, dims.volWeightKg || 0);
-  const longestSide    = dims.longestSideCm || 0;
-
-  // Sort tiers by sort_order
-  const sorted = [...tiers].sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0));
-
-  for (const tier of sorted) {
-    const maxWeight  = tier.max_weight_kg   != null ? Number(tier.max_weight_kg)   : Infinity;
-    const minWeight  = tier.min_weight_kg   != null ? Number(tier.min_weight_kg)   : 0;
-    const maxVolWt   = tier.max_vol_weight  != null ? Number(tier.max_vol_weight)  : Infinity;
-    const maxSide    = tier.max_longest_side_cm != null ? Number(tier.max_longest_side_cm) : Infinity;
-
-    const weightOk   = billableWeight >= minWeight && billableWeight <= maxWeight;
-    const longestOk  = longestSide <= maxSide;
-
-    if (weightOk && longestOk) {
-      return Number(tier.cost) || 0;
-    }
+// Evaluate a single condition against product dimensions
+function evalShipCondition(cond, dims) {
+  const fieldMap = {
+    Weight:     dims.weightKg    || 0,
+    Width:      dims.widthCm     || 0,
+    Height:     dims.heightCm    || 0,
+    Depth:      dims.lengthCm    || 0,
+    vol_weight: dims.volWeightKg || 0,
+  };
+  const actual = fieldMap[cond.field];
+  if (actual === undefined) return true;
+  const v = parseFloat(cond.value);
+  if (isNaN(v)) return true;
+  switch (cond.operator) {
+    case 'lt':  return actual <  v;
+    case 'lte': return actual <= v;
+    case 'gt':  return actual >  v;
+    case 'gte': return actual >= v;
+    case 'eq':  return actual === v;
+    default:    return true;
   }
+}
 
-  // No tier matched — use last tier's cost as fallback (oversized)
-  return Number(sorted[sorted.length - 1]?.cost) || 0;
+// Step 1: Classify product into a parcel class (XS/S/M/L/XL/etc.)
+// Classification rules sorted by priority — first match wins
+// Returns class label string or null if no match
+function classifyParcel(dims, classRules) {
+  if (!dims || !classRules || !classRules.length) return null;
+  const sorted = [...classRules].sort((a, b) => (a.priority || 1) - (b.priority || 1));
+  for (const rule of sorted) {
+    const conditions = rule.conditions || [];
+    if (!conditions.length) return rule.class_label || null; // catch-all
+    const logicOp = (rule.logic_op || 'AND').toUpperCase();
+    const results = conditions.map(c => evalShipCondition(c, dims));
+    const matched = logicOp === 'OR' ? results.some(Boolean) : results.every(Boolean);
+    if (matched) return rule.class_label || null;
+  }
+  return null;
+}
+
+// Step 2: Look up inbound shipping cost from class label + inbound rates table
+function getInboundCost(classLabel, inboundRates) {
+  if (!classLabel || !inboundRates || !inboundRates.length) return 0;
+  const rate = inboundRates.find(r => r.class_label === classLabel);
+  return rate ? Number(rate.cost) || 0 : 0;
+}
+
+// Combined: classify then cost — returns { shippingClass, shippingCost }
+function applyShippingTiers(dims, rules) {
+  if (!dims || !rules || !rules.length) return { shippingClass: null, shippingCost: 0 };
+
+  // Separate classification rules from inbound rate rows
+  const classRules   = rules.filter(r => r.rule_type === 'class' || !r.rule_type);
+  const inboundRates = rules.filter(r => r.rule_type === 'rate');
+
+  const shippingClass = classifyParcel(dims, classRules);
+  const shippingCost  = getInboundCost(shippingClass, inboundRates);
+
+  return { shippingClass, shippingCost };
 }
 
 function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
@@ -963,11 +996,12 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
     }
   }
 
-  // Apply shipping cost based on product dimensions from specs
-  if (shippingTiers.length && product.specs) {
-    const dims = extractDimensions(product.specs);
-    if (dims) {
-      const shippingCost = applyShippingTiers(dims, shippingTiers);
+  // Apply parcel classification + inbound shipping cost from specs
+  const _dims = extractDimensions(product.specs);
+  if (_dims) {
+    const { shippingClass, shippingCost } = applyShippingTiers(_dims, shippingTiers);
+    if (shippingClass)  product.shipping_class = shippingClass;
+    if (shippingCost > 0) {
       product.shipping_cost = parseFloat(shippingCost.toFixed(2));
       product.sale_price    = parseFloat((product.sale_price + shippingCost).toFixed(2));
     }
