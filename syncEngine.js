@@ -241,6 +241,15 @@ async function runSupplierSync(supabase, supplier) {
       const sample = normalised[0];
       console.log(`[SYNC] Sample normalised product keys: ${JSON.stringify(Object.keys(sample))}`);
       console.log(`[SYNC] Sample EAN: ${sample.ean}, Category: ${sample.category}, Brand: ${sample.brand}`);
+      // Debug shipping
+      const _sampleDims = extractDimensions(sample.specs);
+      console.log(`[SYNC] Sample specs keys: ${sample.specs ? JSON.stringify(Object.keys(sample.specs).slice(0,8)) : 'null'}`);
+      console.log(`[SYNC] Sample dims: ${JSON.stringify(_sampleDims)}`);
+      console.log(`[SYNC] Shipping tiers loaded: ${shippingTiers.length}`);
+      if (shippingTiers.length && _sampleDims) {
+        const _sr = applyShippingTiers(_sampleDims, shippingTiers);
+        console.log(`[SYNC] Sample shipping result: ${JSON.stringify(_sr)}`);
+      }
     }
 
     for (let i = 0; i < normalised.length; i += SUPABASE_CHUNK) {
@@ -992,7 +1001,7 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
 
   // Apply parcel classification + inbound shipping cost from specs
   const _dims = extractDimensions(product.specs);
-  if (_dims) {
+  if (_dims && shippingTiers.length) {
     const { shippingClass, shippingCost } = applyShippingTiers(_dims, shippingTiers);
     if (shippingClass)  product.shipping_class = shippingClass;
     if (shippingCost > 0) {
