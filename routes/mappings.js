@@ -58,7 +58,7 @@ router.delete('/markup/:id', async (req, res) => {
 
 // Shipping tiers
 router.get('/shipping', async (req, res) => {
-  let q = req.sb.from('shipping_tiers').select('*').order('sort_order');
+  let q = req.sb.from('shipping_tiers').select('*').order('priority');
   if (req.query.supplier_id) q = q.eq('supplier_id', req.query.supplier_id);
   const { data, error } = await q;
   if (error) return res.status(500).json({ error: error.message });
