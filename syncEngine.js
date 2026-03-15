@@ -137,20 +137,32 @@ async function runSupplierSync(supabase, supplier) {
         const { data: existingCats } = await supabase.from('supplier_categories')
           .select('id, name, external_id, path').eq('supplier_id', supplier.id);
         if (existingCats) {
-          // Build case-insensitive lookup
           const catCountsLower = {};
           for (const [k,v] of Object.entries(catCounts)) catCountsLower[k.toLowerCase()] = v;
           console.log(`[SYNC] Category counts sample: ${JSON.stringify(Object.entries(catCounts).slice(0,5))}`);
-          let updated = 0;
-          for (const cat of existingCats) {
-            const count = catCounts[cat.name] || catCounts[cat.external_id] || catCounts[cat.path]
+
+          // Build update rows for all categories in one bulk upsert
+          const updateRows = existingCats.map(cat => {
+            // Match ClassCode to category name/external_id (top-level classes)
+            const count = catCounts[cat.name] || catCounts[cat.external_id]
                        || catCountsLower[cat.name?.toLowerCase()] || catCountsLower[cat.external_id?.toLowerCase()]
                        || 0;
+            return { ...cat, product_count: count };
+          });
+
+          const withCounts = updateRows.filter(r => r.product_count > 0);
+          const withZero   = updateRows.filter(r => r.product_count === 0);
+
+          // Bulk update non-zero first, then zero-out the rest
+          if (withCounts.length) {
             await supabase.from('supplier_categories')
-              .update({ product_count: count }).eq('id', cat.id);
-            if (count > 0) updated++;
+              .upsert(withCounts, { onConflict: 'supplier_id,path', ignoreDuplicates: false });
           }
-          console.log(`[SYNC] Category counts updated: ${updated}/${existingCats.length} categories got product counts`);
+          if (withZero.length) {
+            await supabase.from('supplier_categories')
+              .upsert(withZero, { onConflict: 'supplier_id,path', ignoreDuplicates: false });
+          }
+          console.log(`[SYNC] Category counts updated: ${withCounts.length}/${existingCats.length} categories got product counts`);
         }
       } catch(e) { console.warn('[SYNC] Category count update failed:', e.message); }
     }
