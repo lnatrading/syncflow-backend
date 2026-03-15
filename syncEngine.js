@@ -107,12 +107,14 @@ async function runSupplierSync(supabase, supplier) {
     // 5. Load field mappings and markup rules
     const { data: mappings }    = await supabase.from('field_mappings').select('*')
       .eq('supplier_id', supplier.id).eq('active', true);
-    const { data: markupRules } = await supabase.from('markup_rules').select('*')
+    const { data: markupRules }   = await supabase.from('markup_rules').select('*')
       .eq('supplier_id', supplier.id);
+    const { data: shippingTiers } = await supabase.from('shipping_tiers').select('*')
+      .eq('supplier_id', supplier.id).order('sort_order');
 
     // 6. Normalise all products
     let normalised = rawProducts.map(raw =>
-      normaliseProduct(raw, mappings || [], markupRules || [])
+      normaliseProduct(raw, mappings || [], markupRules || [], shippingTiers || [])
     ).filter(p => p.sku); // drop any product with no SKU
     if (rawProducts.length > 0) {
       console.log(`[SYNC] Sample raw product keys: ${JSON.stringify(Object.keys(rawProducts[0]))}`);
@@ -264,6 +266,7 @@ async function runSupplierSync(supabase, supplier) {
         images_all:  product.images_all   || null,
         subcategory: product.subcategory  || null,
         specs:       product.specs        || null,
+        shipping_cost: product.shipping_cost || null,
         status:      product.stock_qty <= 0 ? 'unavailable' : product.stock_qty <= 5 ? 'low' : 'active',
         last_synced: new Date(),
       }));
@@ -742,7 +745,115 @@ function extractText(data) {
 }
 
 // ── NORMALISE PRODUCT ────────────────────────────────────────
-function normaliseProduct(raw, mappings, markupRules) {
+
+// ── UNIT NORMALISATION ───────────────────────────────────────
+// Parses dimension/weight strings from any supplier format into
+// standard units: cm for dimensions, kg for weight.
+// Handles: "598 mm", "45 cm", "1.2 kg", "1200 g", "42.5kg", "598mm"
+function parseUnit(str) {
+  if (str === null || str === undefined) return null;
+  const s = String(str).trim().toLowerCase();
+  const num = parseFloat(s);
+  if (isNaN(num)) return null;
+  if (s.includes('mm'))  return { value: num / 10,    unit: 'cm' };
+  if (s.includes('cm'))  return { value: num,          unit: 'cm' };
+  if (s.includes('m') && !s.includes('mm') && !s.includes('cm')) return { value: num * 100, unit: 'cm' };
+  if (s.includes('kg'))  return { value: num,          unit: 'kg' };
+  if (s.includes(' g') || s.endsWith('g')) return { value: num / 1000, unit: 'kg' };
+  if (s.includes('lb'))  return { value: num * 0.453592, unit: 'kg' };
+  return { value: num, unit: 'raw' }; // unknown unit, return raw number
+}
+
+// Extract and normalise product dimensions from specs jsonb
+// Returns { weightKg, lengthCm, widthCm, heightCm, volWeightKg } or null
+function extractDimensions(specs) {
+  if (!specs || typeof specs !== 'object') return null;
+
+  // Common label variations across suppliers
+  const weightLabels  = ['weight','Weight','Gewicht','Masa','waga'];
+  const lengthLabels  = ['length','Length','depth','Depth','Tiefe','Länge'];
+  const widthLabels   = ['width','Width','Breite','Szerokość'];
+  const heightLabels  = ['height','Height','Höhe','Wysokość'];
+
+  function findVal(labels) {
+    for (const l of labels) {
+      if (specs[l] !== undefined && specs[l] !== null && specs[l] !== '') {
+        const parsed = parseUnit(specs[l]);
+        if (parsed) return parsed.value * (parsed.unit === 'raw' ? 1 : 1);
+        // Already normalized above — just return the normalized value
+      }
+    }
+    return null;
+  }
+
+  // Normalize all values
+  function findNorm(labels, targetUnit) {
+    for (const l of labels) {
+      const raw = specs[l];
+      if (raw === undefined || raw === null || raw === '') continue;
+      const p = parseUnit(raw);
+      if (!p) continue;
+      if (targetUnit === 'cm') {
+        if (p.unit === 'cm')  return p.value;
+        if (p.unit === 'raw') return p.value; // assume cm
+      }
+      if (targetUnit === 'kg') {
+        if (p.unit === 'kg')  return p.value;
+        if (p.unit === 'raw') return p.value; // assume kg
+      }
+      return p.value;
+    }
+    return null;
+  }
+
+  const weightKg = findNorm(weightLabels, 'kg');
+  const lengthCm = findNorm(lengthLabels, 'cm');
+  const widthCm  = findNorm(widthLabels,  'cm');
+  const heightCm = findNorm(heightLabels, 'cm');
+
+  if (!weightKg && !lengthCm) return null;
+
+  // Volumetric weight: L × W × H / 5000 (standard courier formula)
+  const volWeightKg = (lengthCm && widthCm && heightCm)
+    ? (lengthCm * widthCm * heightCm) / 5000
+    : null;
+
+  // Longest side
+  const longestSideCm = Math.max(lengthCm || 0, widthCm || 0, heightCm || 0) || null;
+
+  return { weightKg, lengthCm, widthCm, heightCm, volWeightKg, longestSideCm };
+}
+
+// Apply shipping tiers to a product — returns shipping cost in EUR
+// Tier matching: use the HIGHER of actual weight and volumetric weight (billable weight)
+function applyShippingTiers(dims, tiers) {
+  if (!dims || !tiers || !tiers.length) return 0;
+
+  const billableWeight = Math.max(dims.weightKg || 0, dims.volWeightKg || 0);
+  const longestSide    = dims.longestSideCm || 0;
+
+  // Sort tiers by sort_order
+  const sorted = [...tiers].sort((a, b) => (a.sort_order || 0) - (b.sort_order || 0));
+
+  for (const tier of sorted) {
+    const maxWeight  = tier.max_weight_kg   != null ? Number(tier.max_weight_kg)   : Infinity;
+    const minWeight  = tier.min_weight_kg   != null ? Number(tier.min_weight_kg)   : 0;
+    const maxVolWt   = tier.max_vol_weight  != null ? Number(tier.max_vol_weight)  : Infinity;
+    const maxSide    = tier.max_longest_side_cm != null ? Number(tier.max_longest_side_cm) : Infinity;
+
+    const weightOk   = billableWeight >= minWeight && billableWeight <= maxWeight;
+    const longestOk  = longestSide <= maxSide;
+
+    if (weightOk && longestOk) {
+      return Number(tier.cost) || 0;
+    }
+  }
+
+  // No tier matched — use last tier's cost as fallback (oversized)
+  return Number(sorted[sorted.length - 1]?.cost) || 0;
+}
+
+function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
   const product = {};
 
   const internalKeyMap = {
@@ -849,6 +960,16 @@ function normaliseProduct(raw, mappings, markupRules) {
 
     if (rule) {
       product.sale_price = parseFloat((product.cost_price * (1 + parseFloat(rule.markup_pct) / 100)).toFixed(2));
+    }
+  }
+
+  // Apply shipping cost based on product dimensions from specs
+  if (shippingTiers.length && product.specs) {
+    const dims = extractDimensions(product.specs);
+    if (dims) {
+      const shippingCost = applyShippingTiers(dims, shippingTiers);
+      product.shipping_cost = parseFloat(shippingCost.toFixed(2));
+      product.sale_price    = parseFloat((product.sale_price + shippingCost).toFixed(2));
     }
   }
 
