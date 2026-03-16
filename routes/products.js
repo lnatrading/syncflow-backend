@@ -12,8 +12,9 @@ router.get('/', async (req, res) => {
     .order('created_at', { ascending: false })
     .range((page - 1) * limit, page * limit - 1);
 
-  if (search) q = q.or(`name.ilike.%${search}%,sku.ilike.%${search}%`);
-  if (status) q = q.eq('status', status);
+  if (search)      q = q.or(`name.ilike.%${search}%,sku.ilike.%${search}%,ean.ilike.%${search}%`);
+  if (status)      q = q.eq('status', status);
+  if (req.query.supplier_id) q = q.eq('supplier_id', req.query.supplier_id);
 
   const { data, error, count } = await q;
   if (error) return res.status(500).json({ error: error.message });
