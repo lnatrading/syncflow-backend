@@ -246,10 +246,15 @@ async function runSupplierSync(supabase, supplier) {
       const _sampleDims = extractDimensions(sample.specs);
       console.log(`[SYNC] Sample specs keys: ${sample.specs ? JSON.stringify(Object.keys(sample.specs).slice(0,8)) : 'null'}`);
       console.log(`[SYNC] Sample dims: ${JSON.stringify(_sampleDims)}`);
-      console.log(`[SYNC] Shipping tiers loaded: ${shippingTiers.length}`);
+      const _classRules = shippingTiers.filter(r => r.rule_type === 'class' || !r.rule_type);
+      const _rateRules  = shippingTiers.filter(r => r.rule_type === 'rate');
+      console.log(`[SYNC] Shipping: ${_classRules.length} class rules, ${_rateRules.length} inbound rates`);
+      if (_classRules.length > 0) {
+        console.log(`[SYNC] First class rule: ${JSON.stringify(_classRules[0])}`);
+      }
       if (shippingTiers.length && _sampleDims) {
         const _sr = applyShippingTiers(_sampleDims, shippingTiers);
-        console.log(`[SYNC] Sample shipping result: ${JSON.stringify(_sr)}`);
+        console.log(`[SYNC] Sample shipping result: class=${_sr.shippingClass}, cost=${_sr.shippingCost}`);
       }
     }
 
