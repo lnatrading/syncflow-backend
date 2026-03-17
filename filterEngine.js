@@ -121,17 +121,23 @@ function evaluateRule(product, rule) {
 // Supports core fields and arbitrary attribute names.
 function getProductField(product, field) {
   switch (field) {
-    case 'price':       return product.sale_price;
-    case 'cost_price':  return product.cost_price;
+    case 'price':          return product.sale_price;
+    case 'cost_price':     return product.cost_price;
     case 'stock_qty':
-    case 'qty':         return product.stock_qty;
-    case 'category':    return product.category;
-    case 'name':        return product.name;
-    case 'description': return product.description;
-    case 'sku':         return product.sku;
-    case 'ean':         return product.ean || product.barcode || product.gtin || null;
+    case 'qty':            return product.stock_qty;
+    case 'category':       return product.category;
+    case 'subcategory':    return product.subcategory;
+    case 'name':           return product.name;
+    case 'description':    return product.description;
+    case 'sku':            return product.sku;
+    case 'ean':            return product.ean || product.barcode || product.gtin || null;
+    case 'brand':          return product.brand;
+    case 'shipping_class': return product.shipping_class;
+    case 'weight_kg':      return product.weight_kg;
+    case 'width_cm':       return product.width_cm;
+    case 'height_cm':      return product.height_cm;
+    case 'depth_cm':       return product.depth_cm;
     default:
-      // Try as a direct property (covers custom attributes stored on the product)
       return product[field] ?? null;
   }
 }

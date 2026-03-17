@@ -149,6 +149,15 @@ async function runSupplierSync(supabase, supplier) {
         findClasses(catParsed);
         console.log(`[SYNC] Categories: found ${classArr.length} top-level classes`);
         if (classArr.length) {
+          // Count total subcategories
+          let totalSubs = 0;
+          for (const cls of classArr) {
+            const subs = cls.SubClass || [];
+            totalSubs += Array.isArray(subs) ? subs.length : 1;
+          }
+          console.log(`[SYNC] Categories: ${totalSubs} total subcategories across all classes`);
+          // Log first class to verify structure
+          console.log(`[SYNC] First class sample: ${JSON.stringify(classArr[0]).slice(0,200)}`);
           await discoverCategories(supabase, supplier.id, classArr);
         }
       } catch(e) {
@@ -277,6 +286,10 @@ async function runSupplierSync(supabase, supplier) {
         specs:       product.specs        || null,
         shipping_cost:  product.shipping_cost  || null,
         shipping_class: product.shipping_class || null,
+        weight_kg:      product._dims?.weightKg  || null,
+        width_cm:       product._dims?.widthCm   || null,
+        height_cm:      product._dims?.heightCm  || null,
+        depth_cm:       product._dims?.lengthCm  || null,
         status:      product.stock_qty <= 0 ? 'unavailable' : product.stock_qty <= 5 ? 'low' : 'active',
         last_synced: new Date(),
       }));
@@ -1005,8 +1018,9 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
     }
   }
 
-  // Apply parcel classification + inbound shipping cost from specs
+  // Extract and store dimensions for filtering + shipping
   const _dims = extractDimensions(product.specs);
+  if (_dims) product._dims = _dims; // store for upsert
   if (_dims && shippingTiers.length) {
     const { shippingClass, shippingCost } = applyShippingTiers(_dims, shippingTiers);
     if (shippingClass)  product.shipping_class = shippingClass;
