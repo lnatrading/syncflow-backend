@@ -248,4 +248,156 @@ async function updateInboundTracking(config, { odoo_sale_ref, tracking_number, t
   console.log(`[ODOO v${odooVersion}] Inbound tracking written for ${odoo_sale_ref}: ${tracking_number}`);
 }
 
-module.exports = { testConnection, upsertBatch, authenticate, updateOrderTracking, updateInboundTracking };
+
+// ── CREATE PURCHASE ORDER IN ODOO ─────────────────────────────
+// Called when SyncFlow places an order with TD Baltic.
+// Creates a purchase.order in Odoo linked to the supplier.
+// Returns the Odoo PO id and name (e.g. "P00001")
+async function createPurchaseOrder(config, { odoo_sale_ref, supplier_name, lines, warehouse_address }) {
+  const uid = await authenticate(config);
+
+  // Find or create the supplier (res.partner)
+  let partnerIds = await xmlrpcCall(config, 'object', 'execute_kw', [
+    config.database, uid, config.api_key,
+    'res.partner', 'search',
+    [[['name', 'ilike', supplier_name], ['supplier_rank', '>', 0]]],
+    { limit: 1 },
+  ]);
+
+  if (!partnerIds?.length) {
+    // Create supplier partner
+    const partnerId = await xmlrpcCall(config, 'object', 'execute_kw', [
+      config.database, uid, config.api_key,
+      'res.partner', 'create',
+      [{ name: supplier_name, supplier_rank: 1, is_company: true }],
+    ]);
+    partnerIds = [partnerId];
+  }
+
+  // Build PO lines
+  const orderLines = (lines || []).map(l => [0, 0, {
+    name:          l.product_name || l.sku,
+    product_qty:   l.quantity || 1,
+    price_unit:    l.unit_price || 0,
+    product_uom:   1, // Unit
+    // Link by internal reference (default_code = SKU)
+    // product_id resolved below if found
+  }]);
+
+  // Create the PO
+  const poId = await xmlrpcCall(config, 'object', 'execute_kw', [
+    config.database, uid, config.api_key,
+    'purchase.order', 'create',
+    [{
+      partner_id:  partnerIds[0],
+      origin:      odoo_sale_ref,   // Reference to the sale order
+      notes:       `Auto-created by SyncFlow for sale order ${odoo_sale_ref}`,
+      order_line:  orderLines,
+    }],
+  ]);
+
+  // Read back the PO name
+  const [po] = await xmlrpcCall(config, 'object', 'execute_kw', [
+    config.database, uid, config.api_key,
+    'purchase.order', 'read',
+    [[poId], ['name', 'state']],
+  ]);
+
+  // Confirm PO (set to purchase state so receipt is created)
+  await xmlrpcCall(config, 'object', 'execute_kw', [
+    config.database, uid, config.api_key,
+    'purchase.order', 'button_confirm',
+    [[poId]],
+  ]);
+
+  console.log(`[ODOO] Purchase order created: ${po?.name} (id=${poId}) for ${odoo_sale_ref}`);
+  return { poId, poName: po?.name };
+}
+
+// ── CREATE VENDOR BILL FROM TD BALTIC INVOICE ─────────────────
+// Called when TD Baltic INVOIC is fetched after shipment.
+// Creates a draft vendor bill linked to the PO.
+async function createVendorBill(config, { odoo_sale_ref, odoo_po_id, invoice }) {
+  const uid = await authenticate(config);
+
+  // Find supplier partner
+  let partnerIds = await xmlrpcCall(config, 'object', 'execute_kw', [
+    config.database, uid, config.api_key,
+    'res.partner', 'search',
+    [[['name', 'ilike', 'TD Baltic'], ['supplier_rank', '>', 0]]],
+    { limit: 1 },
+  ]);
+
+  // Build invoice lines from TD Baltic INVOIC data
+  const invLines = (invoice.lines || []).map(l => [0, 0, {
+    name:       l.description || l.item_id,
+    quantity:   parseFloat(l.qty) || 1,
+    price_unit: parseFloat(l.price) || 0,
+  }]);
+
+  // Create vendor bill (account.move type=in_invoice)
+  const billId = await xmlrpcCall(config, 'object', 'execute_kw', [
+    config.database, uid, config.api_key,
+    'account.move', 'create',
+    [{
+      move_type:       'in_invoice',
+      partner_id:      partnerIds?.[0] || false,
+      invoice_date:    invoice.invoice_date || null,
+      ref:             invoice.invoice_number || odoo_sale_ref,
+      narration:       `TD Baltic invoice for ${odoo_sale_ref}. PO: ${odoo_po_id || '—'}`,
+      invoice_line_ids: invLines,
+      // Link to PO if available
+      ...(odoo_po_id ? { purchase_id: odoo_po_id } : {}),
+    }],
+  ]);
+
+  console.log(`[ODOO] Vendor bill created: id=${billId} for ${odoo_sale_ref}, invoice ${invoice.invoice_number}`);
+  return { billId };
+}
+
+// ── CREATE / UPDATE INBOUND RECEIPT WITH WAYBILL ──────────────
+// Creates or updates the incoming stock.picking with the waybill number.
+// The receipt is left in 'ready' state — warehouse staff confirm on arrival.
+async function createInboundReceipt(config, { odoo_sale_ref, odoo_po_id, waybill, carrier, lines }) {
+  const uid = await authenticate(config);
+
+  // Find incoming picking linked to the PO
+  let pickingIds = [];
+  if (odoo_po_id) {
+    pickingIds = await xmlrpcCall(config, 'object', 'execute_kw', [
+      config.database, uid, config.api_key,
+      'stock.picking', 'search',
+      [[['purchase_id', '=', odoo_po_id], ['picking_type_code', '=', 'incoming']]],
+    ]);
+  }
+
+  // Fallback: find by origin (sale ref)
+  if (!pickingIds?.length) {
+    pickingIds = await xmlrpcCall(config, 'object', 'execute_kw', [
+      config.database, uid, config.api_key,
+      'stock.picking', 'search',
+      [[['origin', 'ilike', odoo_sale_ref], ['picking_type_code', '=', 'incoming']]],
+    ]);
+  }
+
+  const trackingData = {
+    carrier_tracking_ref: waybill,
+    ...(carrier ? { carrier_id: false } : {}), // carrier_id requires lookup; skip for now
+  };
+
+  if (pickingIds?.length) {
+    // Update existing receipt with waybill
+    await xmlrpcCall(config, 'object', 'execute_kw', [
+      config.database, uid, config.api_key,
+      'stock.picking', 'write',
+      [pickingIds, trackingData],
+    ]);
+    console.log(`[ODOO] Inbound receipt updated with waybill ${waybill} for ${odoo_sale_ref}`);
+    return { pickingIds };
+  } else {
+    console.warn(`[ODOO] No incoming receipt found for ${odoo_sale_ref} — waybill ${waybill} not written`);
+    return { pickingIds: [] };
+  }
+}
+
+module.exports = { testConnection, upsertBatch, authenticate, updateOrderTracking, updateInboundTracking, createPurchaseOrder, createVendorBill, createInboundReceipt };

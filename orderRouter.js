@@ -52,8 +52,7 @@ function getClient(supplierName) {
 async function routeAndPlace(supabase, odooOrder) {
   console.log(`[ROUTER] Processing order ${odooOrder.odoo_sale_ref} — ${odooOrder.lines?.length} lines`);
 
-  // 1. Load warehouse address — this is what we send to ALL suppliers.
-  //    In cross-docking, suppliers ship TO our warehouse, not to the customer.
+  // 1. Load warehouse address — suppliers always ship to warehouse (cross-dock model)
   const { data: warehouse } = await supabase
     .from('warehouse_config').select('*').eq('id', 1).single();
 
@@ -77,7 +76,7 @@ async function routeAndPlace(supabase, odooOrder) {
     vat:     warehouse.vat_number || '',
   };
 
-  // Store customer address on the odooOrder for reference only (not sent to supplier)
+  // Customer address stored for reference only — not sent to supplier
   const customerAddress = odooOrder.shipping_address || odooOrder.billing_address;
 
   // Mark as routing
@@ -87,12 +86,12 @@ async function routeAndPlace(supabase, odooOrder) {
 
   // 2. For each line: find cheapest supplier that carries the SKU
   const routingErrors = [];
-  const supplierBuckets = {};  // supplierId → { supplier, lines[] }
+  const supplierBuckets = {};  // supplierId → { supplier, lines[], fulfillment_model }
 
   for (const line of odooOrder.lines) {
     const { data: candidates } = await supabase
       .from('products')
-      .select('supplier_id, cost_price, stock_qty, suppliers(id, name, active)')
+      .select('supplier_id, cost_price, stock_qty, suppliers(id, name, active, fulfillment_model)')
       .eq('sku', line.sku)
       .gt('stock_qty', 0)
       .order('cost_price', { ascending: true })
@@ -128,15 +127,14 @@ async function routeAndPlace(supabase, odooOrder) {
     });
   }
 
-  // 3. Create supplier_order rows and place each one
+  // 3. Create supplier_order rows and place each one (cross-dock: always ship to warehouse)
   const results = [];
   for (const [supplierId, bucket] of Object.entries(supplierBuckets)) {
     const result = await placeSingleSupplierOrder(supabase, {
       ...odooOrder,
-      // CROSS-DOCK: always ship to warehouse, never to customer
       shipping_address: warehouseAddress,
       billing_address:  warehouseAddress,
-      customer_address: customerAddress,  // stored for reference only
+      customer_address: customerAddress,
     }, supplierId, bucket);
     results.push(result);
   }
@@ -146,12 +144,43 @@ async function routeAndPlace(supabase, odooOrder) {
   const allOk     = !hasErrors && results.every(r => r.status === 'placed');
 
   await supabase.from('odoo_incoming_orders').update({
-    status:       allOk ? 'routed' : hasErrors ? 'error' : 'partial',
-    routing_error:routingErrors.join('; ') || null,
-    processed_at: new Date(),
+    status:        allOk ? 'routed' : hasErrors ? 'error' : 'partial',
+    routing_error: routingErrors.join('; ') || null,
+    processed_at:  new Date(),
   }).eq('odoo_sale_ref', odooOrder.odoo_sale_ref);
 
   console.log(`[ROUTER] Order ${odooOrder.odoo_sale_ref} done — ${results.length} supplier order(s), ${routingErrors.length} routing error(s)`);
+
+  // Create Purchase Orders in Odoo for each supplier bucket (cross-dock model)
+  // Done after placement so we have the supplier order refs
+  try {
+    const { data: odooConfig } = await supabase.from('odoo_config').select('*').limit(1).single();
+    if (odooConfig?.url) {
+      const odooClient = require('./odooClient');
+      for (const result of results.filter(r => r.status === 'placed')) {
+        try {
+          const { poId, poName } = await odooClient.createPurchaseOrder(odooConfig, {
+            odoo_sale_ref:    odooOrder.odoo_sale_ref,
+            supplier_name:    result.supplierName || 'TD Baltic',
+            lines:            result.lines || [],
+            warehouse_address: warehouseAddress,
+          });
+          // Store PO id on the supplier_order row for later invoice linking
+          if (poId && result.supplierOrderDbId) {
+            await supabase.from('supplier_orders')
+              .update({ odoo_po_id: poId, odoo_po_name: poName })
+              .eq('id', result.supplierOrderDbId);
+          }
+          console.log(`[ROUTER] Odoo PO created: ${poName} for ${odooOrder.odoo_sale_ref}`);
+        } catch(poErr) {
+          console.warn(`[ROUTER] Failed to create Odoo PO for ${odooOrder.odoo_sale_ref}: ${poErr.message}`);
+        }
+      }
+    }
+  } catch(e) {
+    console.warn(`[ROUTER] Odoo PO creation skipped: ${e.message}`);
+  }
+
   return { results, routingErrors };
 }
 
