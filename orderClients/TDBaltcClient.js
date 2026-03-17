@@ -1,96 +1,190 @@
 // ============================================================
 //  SyncFlow — orderClients/TDBalticClient.js
-//  TD Baltic XML API — order placement & status
-//  Auth: query params (orgnum, username, pwd)
+//  TD Baltic XML API — order placement & status tracking
+//  Docs: Automated Order Processing via XML, Revision 2.1
+//
+//  ORDSND: POST to ixml.ORDSND with XML in body (UTF-8)
+//  ORDRSP: GET ixml.ordrsp?origdocref= for order status
+//  Auth:   orgnum, username, pwd as POST/GET params
 // ============================================================
 const axios  = require('axios');
-const { XMLParser, XMLBuilder } = require('fast-xml-parser');
+const { XMLParser } = require('fast-xml-parser');
 
-const BASE    = 'http://tdonline.tdbaltic.net/pls/PROD/ixml';
-const AUTH_QS = 'orgnum=276054&username=ABAYOUMI-XML&pwd=CT04ct09ct1984*';
-const parser  = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
-const builder = new XMLBuilder({ ignoreAttributes: false, attributeNamePrefix: '@_' });
+const BASE    = 'https://tdonline.tdbaltic.net/pls/PROD';
+const ORGNUM  = '276054';
+const USERNAME = 'ABAYOUMI-XML';
+const PWD     = 'CT04ct09ct1984*';
+
+const parser = new XMLParser({
+  ignoreAttributes: false,
+  attributeNamePrefix: '@_',
+  isArray: (name) => ['Order','Line','Parcel','Serial'].includes(name),
+});
 
 // ── PLACE ORDER ───────────────────────────────────────────────
-// TD Baltic uses XML POST for order creation
+// Sends XML purchase order via ORDSND endpoint
+// TD Baltic uses HTTP POST with form params including xmlmsg
 async function placeOrder(order) {
-  const xmlLines = order.lines.map(l => ({
-    Line: {
-      PartNumber: l.sku,
-      Quantity:   l.quantity,
-      UnitPrice:  l.unit_price || '',
-    }
-  }));
+  // Build XML order per ORDSND spec (Rev 2.1)
+  const linesXml = (order.lines || []).map(l => `
+    <Line>
+      <ItemID>${escXml(l.sku)}</ItemID>
+      <OrigLineRef>${escXml(l.odoo_line_ref || l.sku)}</OrigLineRef>
+      <Qty>${parseInt(l.quantity) || 1}</Qty>
+    </Line>`).join('');
 
-  const xmlPayload = builder.build({
-    '?xml': { '@_version': '1.0', '@_encoding': 'UTF-8' },
-    Order: {
-      '@_xmlns': 'http://www.tdbaltic.net/ixml',
-      Header: {
-        CustomerReference: order.odoo_sale_ref,
-        ShipToName:        order.shipping_address?.name    || '',
-        ShipToAddress1:    order.shipping_address?.street  || '',
-        ShipToCity:        order.shipping_address?.city    || '',
-        ShipToPostCode:    order.shipping_address?.zip     || '',
-        ShipToCountry:     order.shipping_address?.country || 'PL',
-        ShipToPhone:       order.shipping_address?.phone   || '',
-        ShipToEmail:       order.shipping_address?.email   || '',
-      },
-      Lines: xmlLines,
-    }
+  const addr = order.shipping_address || {};
+  const xmlPayload = `<?xml version="1.0" encoding="UTF-8"?>
+<OrderEnv>
+  <Order>
+    <Head>
+      <OrigDocRef>${escXml(order.odoo_sale_ref)}</OrigDocRef>
+      <DeliverTo>
+        <Address>
+          <Name>${escXml(addr.name || '')}</Name>
+          <Street>${escXml(addr.street || '')}</Street>
+          <City>${escXml(addr.city || '')}</City>
+          <ZIP>${escXml(addr.zip || '')}</ZIP>
+          <CountryCode>${escXml(addr.country || 'PL')}</CountryCode>
+          <ReceiverName>${escXml(addr.name || '')}</ReceiverName>
+          <ReceiverMobileNumber>${escXml(addr.phone || '')}</ReceiverMobileNumber>
+          <ReceiverEmailAddress>${escXml(addr.email || '')}</ReceiverEmailAddress>
+        </Address>
+      </DeliverTo>
+    </Head>
+    <Body>
+      ${linesXml}
+    </Body>
+  </Order>
+</OrderEnv>`;
+
+  // POST as form params — credentials + xmlmsg
+  const params = new URLSearchParams({
+    orgnum:   ORGNUM,
+    username: USERNAME,
+    pwd:      PWD,
+    xmlmsg:   xmlPayload,
   });
 
   const res = await axios.post(
-    `${BASE}.Order?${AUTH_QS}`,
-    xmlPayload,
+    `${BASE}/ixml.ORDSND`,
+    params.toString(),
     {
-      headers: { 'Content-Type': 'text/xml' },
-      timeout: 15000,
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      timeout: 20000,
     }
   );
 
-  const parsed    = parser.parse(res.data);
-  const orderResp = parsed?.OrderResponse || parsed?.Response || {};
-  const orderNum  = orderResp.OrderNumber || orderResp.ConfirmationNumber || order.odoo_sale_ref;
+  // Parse response — success: <Msg ID="0" OrigDocRef="?">Booked order 123456</Msg>
+  const parsed = parser.parse(res.data);
+  const msgEl  = parsed?.Msgs?.Msg || parsed?.Msg || {};
+  const msgId  = msgEl['@_ID'] || msgEl.ID || '';
+  const msgText = typeof msgEl === 'string' ? msgEl : (msgEl['#text'] || msgEl._ || '');
+  const origRef = msgEl['@_OrigDocRef'] || msgEl.OrigDocRef || order.odoo_sale_ref;
+
+  if (String(msgId) !== '0') {
+    throw new Error(`TD Baltic order rejected (ID ${msgId}): ${msgText}`);
+  }
+
+  // Extract TD Baltic order number from message text "Booked order 123456"
+  const orderNumMatch = String(msgText).match(/\d+/);
+  const supplierOrderRef = orderNumMatch ? orderNumMatch[0] : origRef;
 
   return {
-    supplierOrderRef: String(orderNum),
-    supplierOrderId:  String(orderNum),
-    subtotal:         parseFloat(orderResp.Subtotal) || null,
-    shipping:         parseFloat(orderResp.Freight)  || null,
-    total:            parseFloat(orderResp.Total)    || null,
-    raw:              orderResp,
+    supplierOrderRef: String(supplierOrderRef),
+    supplierOrderId:  String(supplierOrderRef),
+    raw:              { msgId, msgText, origRef },
   };
 }
 
 // ── GET TRACKING ───────────────────────────────────────────────
-// GET /ixml.OrderStatus?orgnum=...&OrderNumber=...
+// Uses ORDRSP to get order status and parcel numbers
+// Parcel numbers from <ParcelList> can be used as tracking numbers
 async function getTracking(supplierOrderRef) {
   const res = await axios.get(
-    `${BASE}.OrderStatus?${AUTH_QS}&OrderNumber=${supplierOrderRef}`,
-    { timeout: 10000 }
+    `${BASE}/ixml.ordrsp`,
+    {
+      params: {
+        orgnum:      ORGNUM,
+        username:    USERNAME,
+        pwd:         PWD,
+        origdocref:  supplierOrderRef,
+      },
+      timeout: 15000,
+    }
   );
 
   const parsed = parser.parse(res.data);
-  const status = parsed?.OrderStatusResponse || parsed?.OrderStatus || {};
+  const orders = parsed?.OrderList?.Order || [];
+  const order  = Array.isArray(orders) ? orders[0] : orders;
+
+  if (!order) return { status: 'placed', tracking_number: null };
+
+  const head       = order.Head || {};
+  const orderStatus = head.OrderStatus || '';
+  const lines      = order.Body?.Line || [];
+  const lineArr    = Array.isArray(lines) ? lines : [lines];
+
+  // Get parcel tracking numbers — TD Baltic puts them in INVOIC but
+  // ORDRSP gives us line statuses which we can use to determine status
+  const lineStatuses = lineArr.map(l => String(l.LineStatus || '').toUpperCase());
+  const allShipped  = lineStatuses.length > 0 && lineStatuses.every(s => s === 'CLOSED');
+  const anyShipping = lineStatuses.some(s => s === 'AWAITING_SHIPPING');
+  const allCancelled = lineStatuses.every(s => s === 'CANCELLED');
+
+  // Try to get tracking from invoice endpoint
+  let trackingNumber = null;
+  let trackingUrl    = null;
+  try {
+    const invRes = await axios.get(
+      `${BASE}/ixml.invoic`,
+      {
+        params: { orgnum: ORGNUM, username: USERNAME, pwd: PWD, origdocref: supplierOrderRef },
+        timeout: 10000,
+      }
+    );
+    const invParsed = parser.parse(invRes.data);
+    const invoices  = invParsed?.InvoiceList?.Invoice || [];
+    const inv       = Array.isArray(invoices) ? invoices[0] : invoices;
+    if (inv) {
+      const invLines = inv.Body?.Line || [];
+      const invLine  = Array.isArray(invLines) ? invLines[0] : invLines;
+      if (invLine?.Waybill) trackingNumber = String(invLine.Waybill);
+      // ParcelList for tracking
+      const parcels = invLine?.ParcelList?.Parcel || [];
+      const parcelArr = Array.isArray(parcels) ? parcels : [parcels];
+      if (parcelArr.length) trackingNumber = trackingNumber || String(parcelArr[0]);
+    }
+  } catch(e) {
+    // Invoice not yet available — normal for recently placed orders
+  }
 
   return {
-    status:          mapTDStatus(status.Status || status.OrderStatus),
-    tracking_number: status.TrackingNumber || status.Tracking || null,
-    tracking_url:    status.TrackingURL    || null,
-    carrier:         status.Carrier        || status.Transporter || null,
-    raw:             status,
+    status:          mapTDStatus(orderStatus, allShipped, anyShipping, allCancelled),
+    tracking_number: trackingNumber,
+    tracking_url:    trackingUrl,
+    carrier:         'TD Baltic',
+    raw:             { orderStatus, lineStatuses },
   };
 }
 
-function mapTDStatus(s) {
-  if (!s) return 'placed';
-  const v = String(s).toUpperCase();
-  if (['SHIPPED', 'DISPATCHED', 'SENT'].includes(v)) return 'shipped';
-  if (['DELIVERED', 'COMPLETE', 'COMPLETED'].includes(v)) return 'delivered';
-  if (['CANCELLED', 'CANCELED'].includes(v)) return 'cancelled';
-  if (['ERROR', 'FAILED', 'REJECTED'].includes(v)) return 'error';
+function mapTDStatus(headerStatus, allShipped, anyShipping, allCancelled) {
+  const s = String(headerStatus || '').toUpperCase();
+  if (s === 'CANCELLED' || allCancelled)      return 'cancelled';
+  if (s === 'CLOSED' || allShipped)           return 'shipped';
+  if (s === 'BOOKED' && anyShipping)          return 'placed';
+  if (s === 'BOOKED')                         return 'placed';
+  if (s === 'ENTERED')                        return 'placing';
   return 'placed';
+}
+
+function escXml(str) {
+  return String(str || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
 }
 
 module.exports = { placeOrder, getTracking };
