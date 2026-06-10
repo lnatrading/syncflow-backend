@@ -95,7 +95,7 @@ async function placeOrder(order) {
   };
 }
 
-// ── GET TRACKING ───────────────────────────────────────────────
+// ── GET TRACKING (single order) ────────────────────────────────
 // 1. GET /order/reference/:reference  → order status + tracking_number if shipped
 // 2. GET /packing/show/order/odoo/:reference → delivery notes with tracking URL
 async function getTracking(supplierOrderRef) {
@@ -150,4 +150,45 @@ function mapMediamaxStatus(s) {
   return 'placed';
 }
 
-module.exports = { placeOrder, getTracking };
+// ── GET TRACKING (batch — up to 50 orders) ────────────────────
+// GET /order/batch/reference
+// Body: JSON array of b2b_reference strings
+// Returns same order structure as single order query.
+// Used by trackingPoller to check multiple Mediamax orders in one call
+// instead of one API call per order.
+async function getBatchTracking(supplierOrderRefs) {
+  if (!supplierOrderRefs?.length) return [];
+
+  // Mediamax caps batch at 50 per page — chunk if needed
+  const results = [];
+  const BATCH   = 50;
+
+  for (let i = 0; i < supplierOrderRefs.length; i += BATCH) {
+    const chunk = supplierOrderRefs.slice(i, i + BATCH);
+
+    const res = await axios.get(`${BASE}/order/batch/reference`, {
+      headers: { ...headers(), 'Content-Type': 'application/json' },
+      data:    JSON.stringify(chunk),   // axios GET with body
+      timeout: 15000,
+    });
+
+    const items = res.data?.data || [];
+    for (const item of Array.isArray(items) ? items : []) {
+      const attrs    = item.attributes || {};
+      const mmStatus = attrs.status;
+
+      results.push({
+        supplierOrderRef: attrs.b2b_reference,
+        status:           mapMediamaxStatus(mmStatus),
+        tracking_number:  attrs.tracking_number || null,
+        carrier:          attrs.transporter     || null,
+        tracking_url:     null,   // batch endpoint doesn't return tracking URL
+        raw:              item,
+      });
+    }
+  }
+
+  return results;
+}
+
+module.exports = { placeOrder, getTracking, getBatchTracking };
