@@ -45,9 +45,71 @@ async function pollTracking(supabase) {
 
   console.log(`[TRACKING] Polling ${orders.length} orders...`);
 
+  // Group orders by supplier so we can use batch APIs where available
+  const bySupplier = new Map();
   for (const order of orders) {
-    await pollOne(supabase, order);
-    await sleep(500); // be polite to supplier APIs
+    const name = order.suppliers?.name || '';
+    if (!bySupplier.has(name)) bySupplier.set(name, []);
+    bySupplier.get(name).push(order);
+  }
+
+  for (const [supplierName, supplierOrders] of bySupplier) {
+    const client = getClient(supplierName);
+    if (!client) {
+      console.warn(`[TRACKING] No client for supplier "${supplierName}" — skipping`);
+      continue;
+    }
+
+    // Use batch polling if the client supports it (e.g. Mediamax)
+    if (typeof client.getBatchTracking === 'function') {
+      await pollBatch(supabase, supplierOrders, client);
+    } else {
+      for (const order of supplierOrders) {
+        await pollOne(supabase, order);
+        await sleep(500);
+      }
+    }
+  }
+}
+
+// ── BATCH POLL (for suppliers that support bulk tracking queries) ──
+async function pollBatch(supabase, orders, client) {
+  const refs = orders
+    .filter(o => o.supplier_order_ref)
+    .map(o => o.supplier_order_ref);
+
+  if (!refs.length) return;
+
+  let batchResults;
+  try {
+    batchResults = await client.getBatchTracking(refs);
+  } catch (err) {
+    console.error(`[TRACKING] Batch poll failed: ${err.message} — falling back to one-by-one`);
+    for (const order of orders) {
+      await pollOne(supabase, order);
+      await sleep(500);
+    }
+    return;
+  }
+
+  // Index results by supplierOrderRef for fast lookup
+  const byRef = new Map(batchResults.map(r => [r.supplierOrderRef, r]));
+
+  for (const order of orders) {
+    if (!order.supplier_order_ref) continue;
+    const info = byRef.get(order.supplier_order_ref);
+    if (!info) continue;
+
+    try {
+      await applyTrackingUpdate(supabase, order, info, order.suppliers?.name || '');
+    } catch (err) {
+      console.error(`[TRACKING] Error applying batch update for order #${order.id}: ${err.message}`);
+      await supabase.from('supplier_orders').update({
+        retry_count: (order.retry_count || 0) + 1,
+        last_error:  err.message,
+        updated_at:  new Date(),
+      }).eq('id', order.id);
+    }
   }
 }
 
@@ -67,46 +129,13 @@ async function pollOne(supabase, order) {
 
   try {
     const info = await client.getTracking(order.supplier_order_ref);
-
-    const updates = {
-      updated_at:     new Date(),
-      last_tracked_at:new Date(),
-    };
-
-    let changed = false;
-
-    if (info.status && info.status !== order.status) {
-      updates.status = info.status;
-      changed = true;
-    }
-    if (info.tracking_number && info.tracking_number !== order.tracking_number) {
-      updates.tracking_number = info.tracking_number;
-      updates.tracking_url    = info.tracking_url || order.tracking_url;
-      updates.carrier         = info.carrier      || order.carrier;
-      changed = true;
-    }
-
-    if (changed) {
-      await supabase.from('supplier_orders').update(updates).eq('id', order.id);
-      console.log(`[TRACKING] Updated order #${order.id} (${order.odoo_sale_ref}): status=${updates.status || order.status}, tracking=${updates.tracking_number || order.tracking_number}`);
-
-      // Push tracking to Odoo if we have a tracking number
-      if (updates.tracking_number) {
-        await pushTrackingToOdoo(supabase, order, updates);
-      }
-
-      // If order just shipped, fetch TD Baltic invoice and create vendor bill + receipt
-      if (updates.status === 'shipped' && supplierName.toLowerCase().includes('tdbaltic')) {
-        await fetchInvoiceAndPushToOdoo(supabase, order, updates);
-      }
-    }
+    await applyTrackingUpdate(supabase, order, info, supplierName);
 
     // Reset retry count on success
     if (order.retry_count > 0) {
       await supabase.from('supplier_orders')
         .update({ retry_count: 0 }).eq('id', order.id);
     }
-
   } catch (err) {
     console.error(`[TRACKING] Error polling order #${order.id}: ${err.message}`);
     await supabase.from('supplier_orders').update({
@@ -114,6 +143,42 @@ async function pollOne(supabase, order) {
       last_error:  err.message,
       updated_at:  new Date(),
     }).eq('id', order.id);
+  }
+}
+
+// ── SHARED: APPLY A TRACKING UPDATE TO ONE ORDER ─────────────
+async function applyTrackingUpdate(supabase, order, info, supplierName) {
+  const updates = {
+    updated_at:      new Date(),
+    last_tracked_at: new Date(),
+  };
+
+  let changed = false;
+
+  if (info.status && info.status !== order.status) {
+    updates.status = info.status;
+    changed = true;
+  }
+  if (info.tracking_number && info.tracking_number !== order.tracking_number) {
+    updates.tracking_number = info.tracking_number;
+    updates.tracking_url    = info.tracking_url || order.tracking_url;
+    updates.carrier         = info.carrier      || order.carrier;
+    changed = true;
+  }
+
+  if (changed) {
+    await supabase.from('supplier_orders').update(updates).eq('id', order.id);
+    console.log(`[TRACKING] Updated order #${order.id} (${order.odoo_sale_ref}): status=${updates.status || order.status}, tracking=${updates.tracking_number || order.tracking_number}`);
+
+    // Push tracking to Odoo if we have a tracking number
+    if (updates.tracking_number) {
+      await pushTrackingToOdoo(supabase, order, updates);
+    }
+
+    // If order just shipped and is TD Baltic, fetch invoice
+    if (updates.status === 'shipped' && supplierName.toLowerCase().includes('tdbaltic')) {
+      await fetchInvoiceAndPushToOdoo(supabase, order, updates);
+    }
   }
 }
 
