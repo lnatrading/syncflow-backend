@@ -64,9 +64,27 @@ async function runSupplierSync(supabase, supplier) {
       console.log(`[SYNC] ${supplier.name} — using API version: ${activeVersion.version_label}`);
     }
 
-    // 2. Fetch the products endpoint (always required, role = 'products')
-    const productsEndpoint = endpoints.find(e => e.role === 'products');
+    // ── PER-ENDPOINT FREQUENCY CHECK ─────────────────────────────
+    // Endpoints can opt into their own minimum interval via sync_freq_minutes.
+    // Used by suppliers like Mediamax that publish a heavy daily catalog feed
+    // plus a lightweight fast feed for stock/price updates every 30 min.
+    //
+    // If the main 'products' endpoint isn't due yet AND a 'fast_update'
+    // endpoint exists, run the lightweight stock+price refresh instead of
+    // pulling the full catalog. This respects supplier infrastructure limits.
+    const productsEndpoint   = endpoints.find(e => e.role === 'products');
+    const fastUpdateEndpoint = endpoints.find(e => e.role === 'fast_update');
+
     if (!productsEndpoint) throw new Error('No endpoint with role "products" found.');
+
+    const productsDue = isEndpointDue(productsEndpoint);
+    if (!productsDue && fastUpdateEndpoint) {
+      console.log(`[SYNC] ${supplier.name} — products endpoint not due (sync_freq_minutes=${productsEndpoint.sync_freq_minutes}, last_synced_at=${productsEndpoint.last_synced_at}). Running fast update only.`);
+      await runFastUpdate(supabase, supplier, fastUpdateEndpoint, auth, jobId, activeVersion);
+      return;
+    }
+
+    // 2. Fetch the products endpoint (always required, role = 'products')
 
     // Apply version endpoint override if present
     const productsUrl = versionResolver.resolveEndpointUrl(productsEndpoint, activeVersion);
@@ -91,10 +109,29 @@ async function runSupplierSync(supabase, supplier) {
       !['products', 'categories'].includes(e.role) && !e.is_parameterised
     );
     for (const ep of staticSecondary) {
+      // Per-endpoint frequency check:
+      // If sync_freq_minutes is set, only fetch when its own schedule is due.
+      // This allows a "catalog" endpoint to run once a day while the "products"
+      // fast feed runs every 30 min on the parent supplier's schedule.
+      if (ep.sync_freq_minutes > 0) {
+        const lastFetched = ep.last_synced_at ? new Date(ep.last_synced_at).getTime() : 0;
+        const freqMs      = ep.sync_freq_minutes * 60 * 1000;
+        if ((Date.now() - lastFetched) < freqMs) {
+          console.log(`[SYNC] ${supplier.name} — skipping ${ep.role} endpoint (not due yet, freq=${ep.sync_freq_minutes}min)`);
+          continue;
+        }
+      }
       console.log(`[SYNC] ${supplier.name} — fetching ${ep.role}`);
       const epUrl = versionResolver.resolveEndpointUrl(ep, activeVersion);
       const data = await fetchEndpoint(epUrl, ep.format, auth)
         .catch(e => { console.warn(`[SYNC] ${ep.role} fetch failed:`, e.message); return []; });
+      // Update last_synced_at so the per-endpoint frequency check works next run
+      if (data.length > 0 && ep.sync_freq_minutes > 0) {
+        await supabase.from('supplier_endpoints')
+          .update({ last_synced_at: new Date() })
+          .eq('id', ep.id)
+          .catch(e => console.warn(`[SYNC] Could not update last_synced_at for endpoint ${ep.id}:`, e.message));
+      }
       if (data.length > 0) {
         console.log(`[SYNC] ${ep.role} sample keys: ${JSON.stringify(Object.keys(data[0]))}`);
         console.log(`[SYNC] ${ep.role} sample: ${JSON.stringify(data[0]).slice(0,300)}`);
@@ -240,6 +277,59 @@ async function runSupplierSync(supabase, supplier) {
       console.warn(`[SANITY] ${supplier.name} — ${sanity.warnings} product(s) have large price changes (within acceptable threshold)`);
     }
 
+    // 8c. Detect absent products — in DB with stock > 0 but missing from current feed
+    // If missing for > 24 hours → zero stock in Supabase + Odoo
+    try {
+      const syncedSkus = new Set(normalised.map(p => p.sku).filter(Boolean));
+      const { data: dbProducts } = await supabase
+        .from('products')
+        .select('id, sku, stock_qty, last_synced')
+        .eq('supplier_id', supplier.id)
+        .gt('stock_qty', 0);
+
+      if (dbProducts?.length) {
+        const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000);
+        const absentIds  = [];
+        const absentSkus = [];
+
+        for (const dbProd of dbProducts) {
+          if (!syncedSkus.has(dbProd.sku)) {
+            const lastSeen = dbProd.last_synced ? new Date(dbProd.last_synced) : null;
+            if (!lastSeen || lastSeen < cutoff) {
+              absentIds.push(dbProd.id);
+              absentSkus.push(dbProd.sku);
+            }
+          }
+        }
+
+        if (absentIds.length) {
+          await supabase.from('products')
+            .update({ stock_qty: 0, status: 'outofstock' })
+            .in('id', absentIds);
+          console.log(`[SYNC] ${supplier.name} — ${absentIds.length} absent products zeroed (24h+ missing): ${absentSkus.slice(0,5).join(', ')}${absentIds.length > 5 ? '...' : ''}`);
+
+          // Push zero stock to Odoo for each absent SKU
+          if (odooConfig?.url) {
+            try {
+              const odooClient = require('./odooClient');
+              // Build minimal update payloads — only update x_supplier_qty
+              const absentPayloads = absentSkus.map(sku => ({
+                sku, name: sku, stock_qty: 0,
+                sale_price: null, cost_price: null,
+                _absent: true, // flag to skip non-stock fields
+              }));
+              await odooClient.upsertBatch(odooConfig, absentPayloads);
+              console.log(`[SYNC] Zeroed Odoo stock for ${absentIds.length} absent products`);
+            } catch(e) {
+              console.warn(`[SYNC] Odoo absent stock push failed: ${e.message}`);
+            }
+          }
+        }
+      }
+    } catch(e) {
+      console.warn(`[SYNC] Absent product detection failed: ${e.message}`);
+    }
+
     // 9. SCALE-SAFE UPSERT into Supabase in chunks of 500
     //    Uses upsert with onConflict so we never need a pre-fetch to decide
     //    insert vs update — single round-trip per 500 products.
@@ -382,7 +472,71 @@ async function runSupplierSync(supabase, supplier) {
       }
     }
 
-    // 12. Finalise
+    // 12. Absent product detection
+    //     Products missing from the supplier feed for > 24h get stock zeroed in Odoo.
+    //     This prevents selling items that are no longer available.
+    try {
+      const currentSkus = new Set(normalised.map(p => p.sku).filter(Boolean));
+      const cutoff = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+
+      // Find products that were last synced > 24h ago (absent from current feed)
+      const { data: absentProducts } = await supabase
+        .from('products')
+        .select('id, sku, ean, name, stock_qty')
+        .eq('supplier_id', supplier.id)
+        .gt('stock_qty', 0)           // only ones still showing stock
+        .lt('last_synced', cutoff);   // not updated in last 24h
+
+      if (absentProducts?.length) {
+        const absentFromFeed = absentProducts.filter(p => !currentSkus.has(p.sku));
+        if (absentFromFeed.length) {
+          console.log(`[SYNC] ${supplier.name} — ${absentFromFeed.length} products absent >24h, zeroing stock`);
+
+          // Zero stock in Supabase
+          const absentIds = absentFromFeed.map(p => p.id);
+          await supabase.from('products')
+            .update({ stock_qty: 0, status: 'outofstock' })
+            .in('id', absentIds);
+
+          // Zero stock in Odoo if connected
+          if (odooConfig?.url && absentFromFeed.length) {
+            try {
+              const zeroProducts = absentFromFeed.map(p => ({
+                ...p, stock_qty: 0, sale_price: p.sale_price, cost_price: p.cost_price,
+              }));
+              // Push in small batches — just updating x_supplier_qty to 0
+              for (let i = 0; i < zeroProducts.length; i += 50) {
+                const chunk = zeroProducts.slice(i, i + 50);
+                await odooClient.upsertBatch(odooConfig, chunk).catch(e =>
+                  console.warn(`[SYNC] Failed to zero absent products in Odoo:`, e.message)
+                );
+              }
+              console.log(`[SYNC] Zeroed ${absentFromFeed.length} absent products in Odoo`);
+            } catch(e) {
+              console.warn(`[SYNC] Odoo absent product zero failed:`, e.message);
+            }
+          }
+
+          await supabase.from('activity_log').insert({
+            type:        'stock_zeroed',
+            title:       `${absentFromFeed.length} products absent >24h — stock zeroed`,
+            detail:      `Products absent from ${supplier.name} feed for over 24 hours. SKUs: ${absentFromFeed.slice(0,5).map(p => p.sku).join(', ')}${absentFromFeed.length > 5 ? '...' : ''}`,
+            supplier_id: supplier.id,
+          });
+        }
+      }
+    } catch(e) {
+      console.warn(`[SYNC] Absent product check failed:`, e.message);
+    }
+
+    // 13. Finalise
+    // Mark products endpoint as fetched (used by per-endpoint frequency gating)
+    if (productsEndpoint?.id) {
+      await supabase.from('supplier_endpoints')
+        .update({ last_synced_at: new Date() })
+        .eq('id', productsEndpoint.id);
+    }
+
     await supabase.from('suppliers').update({
       last_sync:     new Date(),
       last_status:   errors > 0 && updated + created === 0 ? 'error' : errors > 0 ? 'partial' : 'success',
@@ -460,6 +614,222 @@ function buildAuth(supplier) {
     default:
       return { type: 'none' };
   }
+}
+
+// ── ENDPOINT FREQUENCY GATE ──────────────────────────────────
+// Returns true if the endpoint is due for a fresh fetch:
+//   • sync_freq_minutes is null/zero → always fetch (default behaviour)
+//   • last_synced_at is null        → never fetched, always due
+//   • elapsed >= sync_freq_minutes   → due
+function isEndpointDue(endpoint) {
+  if (!endpoint) return false;
+  const freq = endpoint.sync_freq_minutes;
+  if (!freq) return true;
+  if (!endpoint.last_synced_at) return true;
+  const elapsedMin = (Date.now() - new Date(endpoint.last_synced_at).getTime()) / 60000;
+  return elapsedMin >= freq;
+}
+
+// ── FAST UPDATE MODE ─────────────────────────────────────────
+// Lightweight stock + price refresh. Used when the main products
+// endpoint isn't due yet but a fast_update endpoint is configured.
+// Designed for supplier feed patterns like Mediamax:
+//   • Complete catalog feed → heavy, daily
+//   • Fast feed (SKU, price, qty, qty2) → light, every 15–30 min
+//
+// What it does:
+//   • Fetches only the fast feed
+//   • Applies markup rules to derive sale_price from cost_price
+//   • Bulk-updates existing rows in products by SKU (NOT a full upsert)
+//   • Pushes the stock/price changes to Odoo via the same upsertBatch path
+//   • Skips: catalog/attribute discovery, parameterised endpoints, filters,
+//     full upsert, full activity logging
+//
+// What it does NOT do:
+//   • Add new SKUs (they appear on the next full catalog sync)
+//   • Update name/desc/images/category (those come from the catalog)
+async function runFastUpdate(supabase, supplier, endpoint, auth, jobId, activeVersion) {
+  const startTs = Date.now();
+
+  // 1. Fetch the fast feed
+  const url = versionResolver.resolveEndpointUrl(endpoint, activeVersion);
+  console.log(`[FAST-SYNC] ${supplier.name} — fetching ${url}`);
+  let rawItems = await fetchEndpoint(url, endpoint.format, auth);
+  rawItems = versionResolver.transformProducts(rawItems, activeVersion);
+
+  if (!Array.isArray(rawItems) || !rawItems.length) {
+    console.warn(`[FAST-SYNC] ${supplier.name} — empty feed, nothing to update`);
+    await supabase.from('sync_jobs').update({
+      status: 'success', products_total: 0, products_updated: 0,
+      products_created: 0, products_errors: 0, finished_at: new Date(),
+    }).eq('id', jobId);
+    return;
+  }
+
+  // 2. Load existing products for this supplier (sku → row)
+  const { data: existing } = await supabase
+    .from('products')
+    .select('id, sku, cost_price, sale_price, category, shipping_cost')
+    .eq('supplier_id', supplier.id);
+  const bySku = new Map((existing || []).map(p => [p.sku, p]));
+  console.log(`[FAST-SYNC] ${supplier.name} — ${existing?.length || 0} known SKUs in DB, ${rawItems.length} in feed`);
+
+  // 3. Load markup rules (so we can recompute sale_price)
+  const { data: markupRules } = await supabase.from('markup_rules')
+    .select('*').eq('supplier_id', supplier.id);
+
+  // 4. Build incoming updates — only for SKUs we already know
+  const incoming = [];     // for sanity check + Odoo push
+  let unknownSkus = 0;
+  for (const item of rawItems) {
+    const sku = item.sku || item.SKU || item.ref || item.code;
+    if (!sku) continue;
+    const existingRow = bySku.get(String(sku));
+    if (!existingRow) { unknownSkus++; continue; }
+
+    const cost_price = parseFloat(item.price || item.cost || item.cost_price || 0);
+    const stock_qty  = parseInt(item.qty || item.quantity || item.stock || 0, 10);
+
+    // Apply markup rule (category-specific first, then default)
+    let sale_price = cost_price;
+    if (markupRules?.length && cost_price > 0) {
+      const rule = markupRules.find(r =>
+        r.category && existingRow.category &&
+        existingRow.category.toLowerCase().includes(r.category.toLowerCase())
+      ) || markupRules.find(r => !r.category);
+      if (rule) sale_price = parseFloat((cost_price * (1 + parseFloat(rule.markup_pct) / 100)).toFixed(2));
+    }
+    // Preserve any baked-in inbound shipping cost from the last full sync
+    if (existingRow.shipping_cost) sale_price = parseFloat((sale_price + existingRow.shipping_cost).toFixed(2));
+
+    incoming.push({
+      id:          existingRow.id,
+      sku:         String(sku),
+      cost_price,
+      sale_price,
+      stock_qty,
+      status:      stock_qty <= 0 ? 'unavailable' : stock_qty <= 5 ? 'low' : 'active',
+      // Forecast 24h availability (Mediamax qty2) — stored for visibility
+      _qty2:       item.qty2 != null ? parseInt(item.qty2, 10) : null,
+    });
+  }
+
+  if (unknownSkus > 0) {
+    console.warn(`[FAST-SYNC] ${supplier.name} — ${unknownSkus} SKUs in feed not yet in DB (will be added on next full catalog sync)`);
+  }
+
+  // 5. Price sanity check — same thresholds as full sync
+  const sanity = await checkPriceSanity(supabase, supplier.id,
+    incoming.map(i => ({ sku: i.sku, cost_price: i.cost_price })));
+  if (sanity.aborted) {
+    const msg = `Fast update price sanity check FAILED for ${supplier.name}: ${sanity.affectedPct}% of products have price changes >${sanity.changeThreshold}% (${sanity.affected}/${sanity.checked}). Update aborted.`;
+    console.error(`[FAST-SYNC] ${msg}`);
+    await supabase.from('activity_log').insert({
+      type: 'price_anomaly', title: '⚠ Fast update aborted — suspicious price changes',
+      detail: msg, supplier_id: supplier.id,
+    });
+    await supabase.from('sync_jobs').update({
+      status: 'error', error_message: msg, finished_at: new Date(),
+      products_errors: incoming.length,
+    }).eq('id', jobId);
+    return;
+  }
+
+  // 6. Bulk-update Supabase rows (in chunks of 500)
+  let updated = 0, errors = 0;
+  for (let i = 0; i < incoming.length; i += SUPABASE_CHUNK) {
+    const chunk = incoming.slice(i, i + SUPABASE_CHUNK);
+    // Supabase has no true "update many by primary key in one call",
+    // so we upsert with id present — fast enough at this batch size.
+    const rows = chunk.map(c => ({
+      id:          c.id,
+      supplier_id: supplier.id,
+      sku:         c.sku,
+      cost_price:  c.cost_price,
+      sale_price:  c.sale_price,
+      stock_qty:   c.stock_qty,
+      status:      c.status,
+      last_synced: new Date(),
+    }));
+    const { error } = await supabase
+      .from('products')
+      .upsert(rows, { onConflict: 'id', ignoreDuplicates: false });
+    if (error) {
+      console.error('[FAST-SYNC] Supabase upsert error:', error.message);
+      errors += chunk.length;
+    } else {
+      updated += chunk.length;
+    }
+  }
+
+  // 7. Push stock + price changes to Odoo using existing upsertBatch path
+  const { data: odooConfig } = await supabase.from('odoo_config').select('*').limit(1).single();
+  let odooBatchErrors = 0;
+  if (odooConfig?.url && incoming.length) {
+    console.log(`[FAST-SYNC] ${supplier.name} — pushing ${incoming.length} stock/price updates to Odoo`);
+    // Hydrate with the minimum payload odooClient.upsertBatch needs
+    const skuToRow = new Map((existing || []).map(p => [p.sku, p]));
+    const odooBatch = incoming.map(c => {
+      const r = skuToRow.get(c.sku) || {};
+      return {
+        sku:        c.sku,
+        name:       r.name || c.sku,
+        cost_price: c.cost_price,
+        sale_price: c.sale_price,
+        stock_qty:  c.stock_qty,
+      };
+    });
+    const batches = [];
+    for (let i = 0; i < odooBatch.length; i += ODOO_CHUNK) {
+      batches.push(odooBatch.slice(i, i + ODOO_CHUNK));
+    }
+    for (let i = 0; i < batches.length; i += ODOO_CONCURRENCY) {
+      const window = batches.slice(i, i + ODOO_CONCURRENCY);
+      const results = await Promise.allSettled(window.map((batch, wi) =>
+        withRetry(() => odooClient.upsertBatch(odooConfig, batch),
+          { maxAttempts: 3, baseDelayMs: 5000, multiplier: 3,
+            label: `Odoo fast batch ${i + wi} (${batch.length} products)` })
+      ));
+      for (const r of results) {
+        if (r.status === 'rejected') {
+          odooBatchErrors++;
+          console.error('[FAST-SYNC] Odoo batch failed:', r.reason?.message);
+        }
+      }
+    }
+  }
+
+  // 8. Mark the fast endpoint as freshly fetched (used by isEndpointDue gating)
+  if (endpoint.id) {
+    await supabase.from('supplier_endpoints')
+      .update({ last_synced_at: new Date() })
+      .eq('id', endpoint.id);
+  }
+
+  // 9. Update supplier + sync_jobs status
+  const finalStatus = errors > 0 && updated === 0 ? 'error' : errors > 0 ? 'partial' : 'success';
+  await supabase.from('suppliers').update({
+    last_sync: new Date(), last_status: finalStatus,
+  }).eq('id', supplier.id);
+
+  await supabase.from('sync_jobs').update({
+    status:           finalStatus,
+    products_total:   incoming.length,
+    products_updated: updated,
+    products_created: 0,
+    products_errors:  errors,
+    finished_at:      new Date(),
+  }).eq('id', jobId);
+
+  const elapsedSec = ((Date.now() - startTs) / 1000).toFixed(1);
+  console.log(`[FAST-SYNC] ${supplier.name} — done in ${elapsedSec}s | ${updated} updated | ${unknownSkus} unknown | ${odooBatchErrors} Odoo batch errors`);
+
+  await supabase.from('activity_log').insert({
+    type:        'sync_complete',
+    title:       `Fast update — ${supplier.name}`,
+    detail:      `${updated} stock/price refreshes in ${elapsedSec}s${unknownSkus ? ` | ${unknownSkus} unknown SKUs (await full sync)` : ''}${odooBatchErrors ? ` | ${odooBatchErrors} Odoo batch errors` : ''}`,
+    supplier_id: supplier.id,
+  });
 }
 
 // ── FETCH A SINGLE ENDPOINT ──────────────────────────────────
@@ -540,6 +910,20 @@ function parseResponse(raw, format) {
 
     if (format === 'csv') {
       return csvParse(raw, { columns: true, skip_empty_lines: true, trim: true });
+    }
+
+    // Mediamax B2B feeds: pipe-separated, single-quote string delimiter
+    // e.g. 'SKU'|'price'|'qty'|'qty2'
+    if (format === 'csv_pipe') {
+      return csvParse(raw, {
+        columns:           true,
+        skip_empty_lines:  true,
+        trim:              true,
+        delimiter:         '|',
+        quote:             "'",
+        relax_quotes:      true,   // handles unquoted numeric fields
+        skip_records_with_error: true,
+      });
     }
 
     // XML (default)
@@ -624,6 +1008,16 @@ function mergeEndpointData(products, secondaryData, role) {
         return { ...p, _attributeData: match };
       case 'variations':
         return { ...p, _variationData: match };
+      case 'catalog':
+        // Catalog provides full product details (name, EAN, desc, images, category, brand).
+        // Spread catalog fields as base, then let the fast feed's fresher stock/price win.
+        // Normalise Mediamax's uppercase/spaced field names to lowercase.
+        // eslint-disable-next-line no-case-declarations
+        const normCat = {};
+        for (const [k, v] of Object.entries(match)) {
+          normCat[k.toLowerCase().replace(/\s+/g, '_')] = v;
+        }
+        return { ...normCat, ...p }; // p (fast feed) overrides catalog stock/price
       default:
         return { ...p, [`_${role}Data`]: match };
     }
@@ -998,8 +1392,46 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
 
   // TD Baltic extras — store for reference / Odoo push
   if (!product.brand)        product.brand        = raw['@_Manuf']           || raw.Manuf           || raw.brand    || null;
-  if (!product.ean)          product.ean          = raw['@_Ean']             || raw.Ean             || raw.ean      || null;
-  if (!product.subcategory)  product.subcategory  = raw['@_SubClassCode']    || raw.SubClassCode    || null;
+  if (!product.ean)          product.ean          = raw['@_Ean']             || raw.Ean             || raw.ean      || raw.EAN   || null;
+  if (!product.subcategory)  product.subcategory  = raw['@_SubClassCode']    || raw.SubClassCode    || raw.product_type || null;
+
+  // ── Mediamax Complete Catalog fields ──────────────────────────────
+  // image1…image5: up to 5 separate image columns
+  if (!product.image_url) {
+    product.image_url = raw.image1 || raw.image || raw.image_url || null;
+  }
+  const mmImages = [raw.image1, raw.image2, raw.image3, raw.image4, raw.image5]
+    .filter(Boolean);
+  if (mmImages.length > 1 && !product.images_all) {
+    product.images_all = mmImages.join('|');
+  }
+
+  // short_description → description fallback
+  if (!product.description) {
+    product.description = raw.short_description || raw.description || null;
+  }
+
+  // weight → stored in specs so shipping tiers can use it
+  if (raw.weight && !product.specs?.weight) {
+    product.specs = product.specs || {};
+    product.specs.weight = raw.weight;
+  }
+
+  // product_status (New / Open Box / Refurbished / Like New) + outlet flag
+  if (raw.product_status) {
+    product.specs = product.specs || {};
+    product.specs.product_status = raw.product_status;
+  }
+  if (raw.outlet) {
+    product.specs = product.specs || {};
+    product.specs.outlet = raw.outlet;
+  }
+
+  // qty2 (Mediamax 24h forecast stock) — store for reference
+  if (raw.qty2 !== undefined) {
+    product.specs = product.specs || {};
+    product.specs.qty2_forecast = raw.qty2;
+  }
   // Warranty: may be a string or an object {value: "24 months"}
   if (!product.warranty) {
     const w = raw['@_Warranty'] || raw.Warranty;
