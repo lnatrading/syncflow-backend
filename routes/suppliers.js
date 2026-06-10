@@ -71,6 +71,7 @@ router.post('/', async (req, res) => {
     format:             ep.format             || 'json',
     is_parameterised:   ep.is_parameterised   || false,
     param_source_field: ep.param_source_field || null,
+    sync_freq_minutes:  ep.sync_freq_minutes  || null,
     active:             true,
     sort_order:         i,
   }));
@@ -124,6 +125,7 @@ router.put('/:id/endpoints', async (req, res) => {
       format:             ep.format             || 'json',
       is_parameterised:   ep.is_parameterised   || false,
       param_source_field: ep.param_source_field || null,
+      sync_freq_minutes:  ep.sync_freq_minutes  || null,
       active:             ep.active !== false,
       sort_order:         i,
     }));
