@@ -866,6 +866,60 @@ async function fetchEndpoint(urlTemplate, format, auth, templateValues = {}) {
     // 'api_key_url' and 'none' need no modification
   }
 
+  // ── Mediamax paginated JSON catalogue ────────────────────────
+  // GET /product/all?pag=N&max=50
+  // Each page returns { code, data: [{ id, attributes:{...} }] }
+  // We loop until a page returns fewer items than requested (last page),
+  // flatten each item's `attributes` into the root, and return the full array.
+  if (format === 'json_paged_mediamax') {
+    const PAGE_SIZE = 50;
+    const allItems  = [];
+    let   page      = 1;
+    let   hasMore   = true;
+
+    while (hasMore) {
+      const sep     = url.includes('?') ? '&' : '?';
+      const pageUrl = `${url}${sep}pag=${page}&max=${PAGE_SIZE}`;
+
+      const res = await withRetry(
+        () => axios.get(pageUrl, axiosOpts),
+        {
+          maxAttempts: 3, baseDelayMs: 5000, multiplier: 3,
+          label: `fetchEndpoint mediamax page ${page}`,
+          onRetry: async (attempt, err) => {
+            const status = err?.response?.status;
+            if (status === 401 || status === 403) throw Object.assign(err, { noRetry: true });
+          },
+        }
+      );
+
+      let parsed;
+      try { parsed = typeof res.data === 'string' ? JSON.parse(res.data) : res.data; }
+      catch { break; }
+
+      const items = parsed?.data || [];
+      if (!Array.isArray(items) || items.length === 0) break;
+
+      // Flatten: { id, attributes: { sku, name, price, ... } } → { id, sku, name, price, ... }
+      for (const item of items) {
+        allItems.push({ id: item.id, ...(item.attributes || {}), links: item.links });
+      }
+
+      // If we got fewer items than the page size, this was the last page
+      hasMore = items.length >= PAGE_SIZE;
+      page++;
+
+      // Safety cap: max 500 pages = 25,000 products
+      if (page > 500) {
+        console.warn(`[SYNC] Mediamax fetchEndpoint: reached page safety cap (${page}). Stopping pagination.`);
+        break;
+      }
+    }
+
+    console.log(`[SYNC] Mediamax fetchEndpoint: fetched ${allItems.length} products across ${page - 1} page(s)`);
+    return allItems;
+  }
+
   // Retry logic: 3 attempts with exponential backoff (5s → 15s → 45s).
   // Handles transient network errors, 429 rate limits, 5xx server errors.
   // Does NOT retry 4xx auth errors (retrying with wrong credentials is pointless).
@@ -1396,7 +1450,7 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
   if (!product.subcategory)  product.subcategory  = raw['@_SubClassCode']    || raw.SubClassCode    || raw.product_type || null;
 
   // ── Mediamax Complete Catalog fields ──────────────────────────────
-  // image1…image5: up to 5 separate image columns
+  // image1…image5: up to 5 separate image columns (CSV feeds)
   if (!product.image_url) {
     product.image_url = raw.image1 || raw.image || raw.image_url || null;
   }
@@ -1406,9 +1460,17 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
     product.images_all = mmImages.join('|');
   }
 
-  // short_description → description fallback
+  // short_description → description fallback (CSV feeds + JSON API)
   if (!product.description) {
-    product.description = raw.short_description || raw.description || null;
+    product.description = raw.short_description || raw.market_description || raw.description || null;
+  }
+
+  // Mediamax JSON API uses 'cost' for cost price and 'qty_available' for stock
+  if (!product.cost_price && raw.cost) {
+    product.cost_price = parseFloat(raw.cost) || null;
+  }
+  if (product.stock_qty == null && raw.qty_available != null) {
+    product.stock_qty = parseInt(raw.qty_available, 10) || 0;
   }
 
   // weight → stored in specs so shipping tiers can use it
@@ -1427,10 +1489,20 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
     product.specs.outlet = raw.outlet;
   }
 
-  // qty2 (Mediamax 24h forecast stock) — store for reference
-  if (raw.qty2 !== undefined) {
+  // qty2 / qty_2 (Mediamax 24h forecast stock) — store for reference
+  const qty2 = raw.qty2 ?? raw.qty_2;
+  if (qty2 !== undefined) {
     product.specs = product.specs || {};
-    product.specs.qty2_forecast = raw.qty2;
+    product.specs.qty2_forecast = qty2;
+  }
+
+  // EPREL energy label fields (from single-product JSON endpoint)
+  if (raw.eficiencia_energetica || raw.eprel_model_identifier) {
+    product.specs = product.specs || {};
+    if (raw.eficiencia_energetica)  product.specs.energy_class       = raw.eficiencia_energetica;
+    if (raw.eprel_model_identifier) product.specs.eprel_model_id     = raw.eprel_model_identifier;
+    if (raw.fiche_url)              product.specs.eprel_fiche_url    = raw.fiche_url;
+    if (raw.label_url)              product.specs.eprel_label_url    = raw.label_url;
   }
   // Warranty: may be a string or an object {value: "24 months"}
   if (!product.warranty) {
