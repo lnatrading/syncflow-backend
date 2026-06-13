@@ -13,7 +13,10 @@ const ACCOUNT_EMAIL = process.env.MEDIAMAX_ACCOUNT_EMAIL || '';
 
 function headers() {
   return {
-    'Authorization': `Bearer ${TOKEN}`,
+    // Mediamax authenticates via the HTTP-API-KEY header with the raw token
+    // (NOT Authorization: Bearer, despite what the PDF docs state — confirmed
+    // by Mediamax IT).
+    'HTTP-API-KEY':  TOKEN,
     'Content-Type':  'application/json',
   };
 }
