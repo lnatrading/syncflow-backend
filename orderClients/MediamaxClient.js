@@ -154,7 +154,7 @@ function mapMediamaxStatus(s) {
 }
 
 // ── GET TRACKING (batch — up to 50 orders) ────────────────────
-// GET /order/batch/reference
+// GET /batch/reference  (per Spanish docs v1.6.2 §2.2.3)
 // Body: JSON array of b2b_reference strings
 // Returns same order structure as single order query.
 // Used by trackingPoller to check multiple Mediamax orders in one call
@@ -169,7 +169,7 @@ async function getBatchTracking(supplierOrderRefs) {
   for (let i = 0; i < supplierOrderRefs.length; i += BATCH) {
     const chunk = supplierOrderRefs.slice(i, i + BATCH);
 
-    const res = await axios.get(`${BASE}/order/batch/reference`, {
+    const res = await axios.get(`${BASE}/batch/reference`, {
       headers: { ...headers(), 'Content-Type': 'application/json' },
       data:    JSON.stringify(chunk),   // axios GET with body
       timeout: 15000,
