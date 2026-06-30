@@ -980,6 +980,21 @@ function parseResponse(raw, format) {
       });
     }
 
+    // ── ITscope tab-separated export ──────────────────────────
+    // api.itscope.com/2.1/t/<token> returns a tab-delimited CSV
+    // with a header row and no quoting. The token is embedded in
+    // the URL — no separate auth header needed.
+    if (format === 'csv_tab_itscope') {
+      return csvParse(raw, {
+        columns:               true,
+        skip_empty_lines:      true,
+        trim:                  true,
+        delimiter:             '\t',
+        relax_column_count:    true,
+        skip_records_with_error: true,
+      });
+    }
+
     // XML (default)
     const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
     const result = parser.parse(raw);
@@ -1444,10 +1459,60 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
     if (Object.keys(specs).length) product.specs = specs;
   }
 
+  // ── ITscope export fields ─────────────────────────────────────
+  // Tab-separated export from api.itscope.com/2.1/t/<token>
+  // Fields: puid, ean, manufacturerSKU, manufacturerName, productName,
+  //         price, stock, aggregatedStock, productTypeName, productTypeGroupName,
+  //         imageHighRes1..5, image2..5, standardPdfDatasheet, shortDescription,
+  //         longDescription, netWeight, netDimX/Y/Z, warrantyText,
+  //         priceSupplierName, marketingText, keySellingPoints, deeplink
+  if (!product.sku)         product.sku         = raw.manufacturerSKU  || raw.puid            || product.sku  || '';
+  if (!product.name)        product.name        = raw.productName       || product.name        || 'Unknown';
+  if (!product.ean)         product.ean         = raw.ean               || product.ean         || null;
+  if (!product.brand)       product.brand       = raw.manufacturerName  || product.brand       || null;
+  if (!product.category)    product.category    = raw.productTypeGroupName || raw.productTypeName || product.category || null;
+  if (!product.subcategory) product.subcategory = raw.productTypeName   || product.subcategory || null;
+  if (!product.cost_price || product.cost_price === 0) {
+    product.cost_price = parseFloat(raw.price || raw.priceCalc || 0) || 0;
+  }
+  if (!product.stock_qty || product.stock_qty === 0) {
+    product.stock_qty = parseInt(raw.stock || raw.aggregatedStock || 0, 10) || 0;
+  }
+
+  // Images: ITscope provides up to 5 hi-res images
+  if (!product.image_url) {
+    product.image_url = raw.imageHighRes1 || raw.imageThumb || null;
+  }
+  const itscopeImages = [raw.imageHighRes1, raw.image2, raw.image3, raw.image4, raw.image5]
+    .filter(Boolean);
+  if (itscopeImages.length > 1 && !product.images_all) {
+    product.images_all = itscopeImages.join('|');
+  }
+
+  // Descriptions: prefer longDescription, fall back to shortDescription / marketingText
+  if (!product.description) {
+    product.description = raw.longDescription || raw.shortDescription || raw.marketingText || null;
+  }
+
+  // Specs: store useful fields for shipping tiers, Icecat enrichment, and BIGhub feed
+  if (raw.netWeight || raw.netDimX || raw.warrantyText || raw.keySellingPoints || raw.standardPdfDatasheet) {
+    product.specs = product.specs || {};
+    if (raw.netWeight)            product.specs.weight          = raw.netWeight;
+    if (raw.netDimX)              product.specs.width           = raw.netDimX;
+    if (raw.netDimY)              product.specs.height          = raw.netDimY;
+    if (raw.netDimZ)              product.specs.depth           = raw.netDimZ;
+    if (raw.warrantyText)         product.specs.warranty        = raw.warrantyText;
+    if (raw.keySellingPoints)     product.specs.key_features    = raw.keySellingPoints;
+    if (raw.standardPdfDatasheet) product.specs.datasheet_url   = raw.standardPdfDatasheet;
+    if (raw.deeplink)             product.specs.itscope_url     = raw.deeplink;
+    if (raw.priceSupplierName)    product.specs.itscope_supplier = raw.priceSupplierName;
+    if (raw.energyEfficiencyClass) product.specs.energy_class   = raw.energyEfficiencyClass;
+  }
+
   // TD Baltic extras — store for reference / Odoo push
-  if (!product.brand)        product.brand        = raw['@_Manuf']           || raw.Manuf           || raw.brand    || null;
-  if (!product.ean)          product.ean          = raw['@_Ean']             || raw.Ean             || raw.ean      || raw.EAN   || null;
-  if (!product.subcategory)  product.subcategory  = raw['@_SubClassCode']    || raw.SubClassCode    || raw.product_type || null;
+  if (!product.brand)        product.brand        = raw['@_Manuf']           || raw.Manuf           || raw.brand    || product.brand || null;
+  if (!product.ean)          product.ean          = raw['@_Ean']             || raw.Ean             || raw.ean      || raw.EAN   || raw.first_ean || raw.EAN1 || product.ean || null;
+  if (!product.subcategory)  product.subcategory  = raw['@_SubClassCode']    || raw.SubClassCode    || raw.product_type || product.subcategory || null;
 
   // ── Mediamax Complete Catalog fields ──────────────────────────────
   // image1…image5: up to 5 separate image columns (CSV feeds)
@@ -1466,11 +1531,20 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
   }
 
   // Mediamax JSON API uses 'cost' for cost price and 'qty_available' for stock
-  if (!product.cost_price && raw.cost) {
-    product.cost_price = parseFloat(raw.cost) || null;
+  // Real "Feed de actualización lenta" uses precio_mediamax_b for cost price
+  if (!product.cost_price && (raw.cost || raw.precio_mediamax_b)) {
+    product.cost_price = parseFloat(raw.cost || raw.precio_mediamax_b) || null;
   }
   if (product.stock_qty == null && raw.qty_available != null) {
     product.stock_qty = parseInt(raw.qty_available, 10) || 0;
+  }
+  // Real feed uses 'quantity' as the stock field name
+  if ((product.stock_qty == null || product.stock_qty === 0) && raw.quantity != null) {
+    product.stock_qty = parseInt(raw.quantity, 10) || 0;
+  }
+  // Real feed uses tipo_producto for sub-category (final category level)
+  if (!product.subcategory && raw.tipo_producto) {
+    product.subcategory = raw.tipo_producto;
   }
 
   // weight → stored in specs so shipping tiers can use it
@@ -1480,9 +1554,10 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
   }
 
   // product_status (New / Open Box / Refurbished / Like New) + outlet flag
-  if (raw.product_status) {
+  // Real Mediamax "Feed de actualización lenta" uses estado_producto, not product_status
+  if (raw.product_status || raw.estado_producto) {
     product.specs = product.specs || {};
-    product.specs.product_status = raw.product_status;
+    product.specs.product_status = raw.product_status || raw.estado_producto;
   }
   if (raw.outlet) {
     product.specs = product.specs || {};
@@ -1494,6 +1569,16 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
   if (qty2 !== undefined) {
     product.specs = product.specs || {};
     product.specs.qty2_forecast = qty2;
+  }
+
+  // Mediamax deeplink + stock-status flag (Feed de actualización lenta)
+  if (raw.link) {
+    product.specs = product.specs || {};
+    product.specs.mediamax_url = raw.link;
+  }
+  if (raw.is_in_stock !== undefined) {
+    product.specs = product.specs || {};
+    product.specs.is_in_stock = raw.is_in_stock;
   }
 
   // EPREL energy label fields (from single-product JSON endpoint)
