@@ -127,10 +127,13 @@ async function runSupplierSync(supabase, supplier) {
         .catch(e => { console.warn(`[SYNC] ${ep.role} fetch failed:`, e.message); return []; });
       // Update last_synced_at so the per-endpoint frequency check works next run
       if (data.length > 0 && ep.sync_freq_minutes > 0) {
-        await supabase.from('supplier_endpoints')
-          .update({ last_synced_at: new Date() })
-          .eq('id', ep.id)
-          .catch(e => console.warn(`[SYNC] Could not update last_synced_at for endpoint ${ep.id}:`, e.message));
+        try {
+          await supabase.from('supplier_endpoints')
+            .update({ last_synced_at: new Date() })
+            .eq('id', ep.id);
+        } catch (e) {
+          console.warn(`[SYNC] Could not update last_synced_at for endpoint ${ep.id}:`, e.message);
+        }
       }
       if (data.length > 0) {
         console.log(`[SYNC] ${ep.role} sample keys: ${JSON.stringify(Object.keys(data[0]))}`);
@@ -840,7 +843,10 @@ async function fetchEndpoint(urlTemplate, format, auth, templateValues = {}) {
   );
 
   const headers = { 'User-Agent': 'SyncFlow/1.0' };
-  const axiosOpts = { timeout: 30000, responseType: 'text', headers };
+  // 90s timeout — some supplier CSV feeds (e.g. Mediamax's full catalogue,
+  // ~1.5MB+) can legitimately take 20-30s+ to generate/transfer, especially
+  // from cloud-hosting IP ranges. 30s was too tight and caused false timeouts.
+  const axiosOpts = { timeout: 90000, responseType: 'text', headers };
 
   switch (auth.type) {
     case 'basic':
