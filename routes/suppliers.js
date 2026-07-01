@@ -152,6 +152,8 @@ router.post('/:id/sync', async (req, res) => {
     .single();
   if (error || !supplier) return res.status(404).json({ error: 'Supplier not found' });
 
+  // Mark as manual so syncEngine bypasses the per-endpoint frequency gate
+  supplier._force = true;
   syncEngine.runSupplierSync(req.sb, supplier).catch(console.error);
   res.json({ message: `Sync started for ${supplier.name}` });
 });
