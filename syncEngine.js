@@ -981,13 +981,17 @@ function parseResponse(raw, format) {
     // Mediamax B2B feeds: pipe-separated, single-quote string delimiter
     // e.g. 'SKU'|'price'|'qty'|'qty2'
     if (format === 'csv_pipe') {
+      // Try double-quote first (Mediamax "Feed de actualización lenta" uses "field"|"field")
+      // then fall back to single-quote (Mediamax fast feeds use 'field'|'field')
+      const firstLine = raw.split('\n')[0] || '';
+      const quoteChar = firstLine.startsWith('"') ? '"' : "'";
       return csvParse(raw, {
         columns:           true,
         skip_empty_lines:  true,
         trim:              true,
         delimiter:         '|',
-        quote:             "'",
-        relax_quotes:      true,   // handles unquoted numeric fields
+        quote:             quoteChar,
+        relax_quotes:      true,
         skip_records_with_error: true,
       });
     }
@@ -1409,7 +1413,7 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
 
   // Fallbacks for common field names
   // Note: XML parsed with attributeNamePrefix '@_', so TD Baltic fields come as @_TDPartNbr etc.
-  if (!product.sku)        product.sku        = raw.sku || raw.ref || raw.code || raw.id || raw.elkoCode
+  if (!product.sku)        product.sku        = raw.SKU || raw.sku || raw.ref || raw.code || raw.id || raw.elkoCode
                                                || raw['@_TDPartNbr'] || raw.TDPartNbr || '';
   if (!product.name)       product.name       = raw.name || raw.title || raw.product_name
                                                || raw['@_ProdDesc'] || raw.ProdDesc || 'Unknown';
