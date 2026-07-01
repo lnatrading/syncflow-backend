@@ -14,7 +14,9 @@ const { withRetry, sleep } = require('./retry');
 // At 500k SKUs this means 1000 DB round-trips total — acceptable.
 // Odoo XML-RPC: 100 per call — Odoo rejects larger payloads.
 // Odoo concurrency: 5 parallel batches — saturates Odoo without overloading.
-const SUPABASE_CHUNK = 500;
+const SUPABASE_CHUNK = 100; // Reduced from 500 — Supabase free/small plans hit statement
+                             // timeouts on large upserts when the products table is big.
+                             // 100 rows/chunk with a small delay keeps each statement fast.
 const ODOO_CHUNK     = 100;
 const ODOO_CONCURRENCY = 5;
 
@@ -403,6 +405,11 @@ async function runSupplierSync(supabase, supplier) {
       } else {
         updated += chunk.length; // we can't tell insert vs update with upsert — treat as updated
       }
+
+      // Small delay between chunks to avoid overwhelming Supabase with
+      // concurrent write load — especially important for large catalogues
+      // (12k+ products) that take many chunks to upsert.
+      await new Promise(r => setTimeout(r, 200));
 
       // Collect stock alerts (out-of-stock items)
       for (const product of chunk) {
