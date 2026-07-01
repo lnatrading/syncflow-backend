@@ -49,10 +49,6 @@ router.post('/', async (req, res) => {
     return res.status(400).json({ error: 'a "products" endpoint is required' });
   }
 
-  // ── ATOMIC CREATION via Postgres RPC ─────────────────────
-  // Uses create_supplier_with_endpoints() which wraps both inserts
-  // in a single transaction. If endpoints fail, the supplier row
-  // is automatically rolled back — no zombie suppliers.
   const supplierPayload = {
     name,
     sync_freq:        sync_freq || 30,
@@ -85,7 +81,6 @@ router.post('/', async (req, res) => {
 
   const supplier = result;
 
-  // Seed default field mappings
   try { await req.sb.rpc('seed_default_mappings', { p_supplier_id: supplier.id }); } catch (_) {}
 
   await req.sb.from('activity_log').insert({
@@ -113,7 +108,6 @@ router.put('/:id/endpoints', async (req, res) => {
   const supplierId = parseInt(req.params.id);
   const { endpoints = [] } = req.body;
 
-  // Delete existing endpoints then re-insert
   await req.sb.from('supplier_endpoints').delete().eq('supplier_id', supplierId);
 
   if (endpoints.length) {
