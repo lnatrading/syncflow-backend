@@ -78,10 +78,16 @@ async function runSupplierSync(supabase, supplier) {
     if (!productsEndpoint) throw new Error('No endpoint with role "products" found.');
 
     const productsDue = isEndpointDue(productsEndpoint);
-    if (!productsDue && fastUpdateEndpoint) {
+    // Manual syncs (force=true) always run the full products fetch —
+    // the frequency gate only applies to scheduled/cron-triggered syncs.
+    const force = supplier._force === true;
+    if (!productsDue && !force && fastUpdateEndpoint) {
       console.log(`[SYNC] ${supplier.name} — products endpoint not due (sync_freq_minutes=${productsEndpoint.sync_freq_minutes}, last_synced_at=${productsEndpoint.last_synced_at}). Running fast update only.`);
       await runFastUpdate(supabase, supplier, fastUpdateEndpoint, auth, jobId, activeVersion);
       return;
+    }
+    if (force && !productsDue) {
+      console.log(`[SYNC] ${supplier.name} — manual sync: forcing full products fetch (ignoring frequency gate).`);
     }
 
     // 2. Fetch the products endpoint (always required, role = 'products')
