@@ -1078,10 +1078,10 @@ function mergeCategories(products, categories) {
 function mergeEndpointData(products, secondaryData, role) {
   if (!secondaryData.length) return products;
 
-  // Build lookup by SKU (try common field names including TD Baltic TDPartNbr)
+  // Build lookup by SKU (try common field names including TD Baltic TDPartNbr and Mediamax uppercase SKU)
   const byId = {};
   for (const item of secondaryData) {
-    const key = item.TDPartNbr || item['@_TDPartNbr'] || item.sku || item.ref || item.code || item.id || item.productId;
+    const key = item.TDPartNbr || item['@_TDPartNbr'] || item.SKU || item.sku || item.ref || item.code || item.id || item.productId;
     if (key != null) byId[String(key)] = item;
   }
 
