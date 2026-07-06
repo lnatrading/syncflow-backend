@@ -1094,7 +1094,7 @@ function mergeEndpointData(products, secondaryData, role) {
   }
 
   return products.map(p => {
-    const key = p.TDPartNbr || p.sku || p.ref || p.code || p.id;
+    const key = p.TDPartNbr || p.SKU || p.sku || p.ref || p.code || p.id;
     const rows = key != null ? byId[String(key)] : null;
     if (!rows || !rows.length) return p;
 
