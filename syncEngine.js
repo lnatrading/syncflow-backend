@@ -1079,16 +1079,29 @@ function mergeEndpointData(products, secondaryData, role) {
   if (!secondaryData.length) return products;
 
   // Build lookup by SKU (try common field names including TD Baltic TDPartNbr and Mediamax uppercase SKU)
+  // Mediamax's EAN-lookup feed keys by sku_parent (the base SKU), not sku
+  // (its own 'sku' column has a variant suffix like "_1"/"_2" for multiple
+  // barcodes per parent — e.g. XIAREDBUDS8GR_1 / sku_parent: XIAREDBUDS8GR).
+  // Group all rows per parent (arrays) so alternate barcodes aren't lost —
+  // the first row is used as the primary match, the rest are kept as alts.
   const byId = {};
   for (const item of secondaryData) {
-    const key = item.TDPartNbr || item['@_TDPartNbr'] || item.SKU || item.sku || item.ref || item.code || item.id || item.productId;
-    if (key != null) byId[String(key)] = item;
+    const key = item.sku_parent || item.TDPartNbr || item['@_TDPartNbr'] || item.SKU || item.sku || item.ref || item.code || item.id || item.productId;
+    if (key == null) continue;
+    const k = String(key);
+    if (!byId[k]) byId[k] = [];
+    byId[k].push(item);
   }
 
   return products.map(p => {
     const key = p.TDPartNbr || p.sku || p.ref || p.code || p.id;
-    const match = key != null ? byId[String(key)] : null;
-    if (!match) return p;
+    const rows = key != null ? byId[String(key)] : null;
+    if (!rows || !rows.length) return p;
+
+    const match = rows[0];
+    // Any additional rows sharing this key are alternates (e.g. a second
+    // valid EAN/barcode for the same parent SKU) — kept, not discarded.
+    const alts = rows.length > 1 ? rows.slice(1) : null;
 
     // Merge relevant fields depending on role
     switch (role) {
@@ -1111,7 +1124,9 @@ function mergeEndpointData(products, secondaryData, role) {
         }
         return { ...normCat, ...p }; // p (fast feed) overrides catalog stock/price
       default:
-        return { ...p, [`_${role}Data`]: match };
+        return alts
+          ? { ...p, [`_${role}Data`]: match, [`_${role}DataAlts`]: alts }
+          : { ...p, [`_${role}Data`]: match };
     }
   });
 }
@@ -1530,6 +1545,25 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
     if (raw.deeplink)             product.specs.itscope_url     = raw.deeplink;
     if (raw.priceSupplierName)    product.specs.itscope_supplier = raw.priceSupplierName;
     if (raw.energyEfficiencyClass) product.specs.energy_class   = raw.energyEfficiencyClass;
+  }
+
+  // Mediamax "Clientes con Catálogo Ampliado por EAN" endpoint — configure
+  // this secondary endpoint with role: 'ean' in the Suppliers dashboard.
+  // mergeEndpointData() attaches its matched row as raw._eanData (matched
+  // on sku_parent, since that feed's own 'sku' has a variant suffix).
+  if (!product.ean && raw._eanData?.ean) product.ean = raw._eanData.ean;
+
+  // Alternate EANs — when the same parent SKU has more than one valid
+  // barcode in the feed (e.g. regional variants), the extras are attached
+  // as raw._eanDataAlts. Keep them for reference rather than discarding.
+  if (Array.isArray(raw._eanDataAlts) && raw._eanDataAlts.length) {
+    const altEans = raw._eanDataAlts
+      .map(r => r.ean)
+      .filter(e => e && e !== product.ean);
+    if (altEans.length) {
+      product.specs = product.specs || {};
+      product.specs.alt_ean = altEans.join('|');
+    }
   }
 
   // TD Baltic extras — store for reference / Odoo push
