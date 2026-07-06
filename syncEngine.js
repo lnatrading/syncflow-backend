@@ -1548,16 +1548,18 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
   }
 
   // Mediamax "Clientes con Catálogo Ampliado por EAN" endpoint — configure
-  // this secondary endpoint with role: 'ean' in the Suppliers dashboard.
-  // mergeEndpointData() attaches its matched row as raw._eanData (matched
+  // this secondary endpoint with role: 'other' in the Suppliers dashboard
+  // (the dashboard's role dropdown has no dedicated 'ean' option, so
+  // 'other' is the generic catch-all role to use here).
+  // mergeEndpointData() attaches its matched row as raw._otherData (matched
   // on sku_parent, since that feed's own 'sku' has a variant suffix).
-  if (!product.ean && raw._eanData?.ean) product.ean = raw._eanData.ean;
+  if (!product.ean && raw._otherData?.ean) product.ean = raw._otherData.ean;
 
   // Alternate EANs — when the same parent SKU has more than one valid
   // barcode in the feed (e.g. regional variants), the extras are attached
-  // as raw._eanDataAlts. Keep them for reference rather than discarding.
-  if (Array.isArray(raw._eanDataAlts) && raw._eanDataAlts.length) {
-    const altEans = raw._eanDataAlts
+  // as raw._otherDataAlts. Keep them for reference rather than discarding.
+  if (Array.isArray(raw._otherDataAlts) && raw._otherDataAlts.length) {
+    const altEans = raw._otherDataAlts
       .map(r => r.ean)
       .filter(e => e && e !== product.ean);
     if (altEans.length) {
