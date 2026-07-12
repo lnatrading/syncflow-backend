@@ -66,13 +66,35 @@ supabase.from('suppliers')
   });
 
 // ── CRON: run sync every minute — with distributed lock to prevent overlap
+// Backoff state: when Supabase returns 402 (quota exceeded) or is unreachable,
+// skip cron ticks for an increasing duration instead of hammering every minute.
+let _cronBackoffUntil = 0;
+let _cronBackoffMinutes = 0;
+
 cron.schedule('* * * * *', async () => {
+  // ── BACKOFF CHECK ──────────────────────────────────────
+  if (Date.now() < _cronBackoffUntil) {
+    return; // still in backoff window — skip silently
+  }
+
   try {
     // Fetch suppliers with their endpoints and lock status
-    const { data: suppliers } = await supabase
+    const { data: suppliers, error: fetchErr } = await supabase
       .from('suppliers')
       .select('*, supplier_endpoints(*)')
       .eq('active', true);
+
+    if (fetchErr) {
+      // Quota exceeded (402) or other Supabase error — enter backoff
+      _cronBackoffMinutes = Math.min((_cronBackoffMinutes || 1) * 2, 60); // 1 → 2 → 4 → 8 → ... → 60 min cap
+      _cronBackoffUntil = Date.now() + _cronBackoffMinutes * 60 * 1000;
+      console.warn(`[CRON] Supabase error (${fetchErr.message}). Backing off for ${_cronBackoffMinutes} min (until ${new Date(_cronBackoffUntil).toISOString()})`);
+      return;
+    }
+
+    // Success — reset backoff
+    _cronBackoffMinutes = 0;
+    _cronBackoffUntil = 0;
 
     if (!suppliers) return;
 
