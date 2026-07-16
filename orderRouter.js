@@ -8,6 +8,7 @@ const ElkoClient    = require('./orderClients/ElkoClient');
 const BigBuyClient  = require('./orderClients/BigBuyClient');
 const MediamaxClient= require('./orderClients/MediamaxClient');
 const TDBalticClient= require('./orderClients/TDBaltcClient');
+const DCSClient     = require('./orderClients/DCSClient');
 const { withRetry } = require('./retry');
 
 // ── RETRY SCHEDULE ─────────────────────────────────────────────
@@ -29,6 +30,7 @@ const CLIENTS = [
   { match: ['bigbuy','big buy'],client: BigBuyClient   },
   { match: ['mediamax'],        client: MediamaxClient },
   { match: ['tdbaltic','td baltic','td_baltic'], client: TDBalticClient },
+  { match: ['dcs'],                             client: DCSClient      },
 ];
 
 function getClient(supplierName) {
