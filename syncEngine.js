@@ -171,6 +171,27 @@ async function runSupplierSync(supabase, supplier) {
     let normalised = rawProducts.map(raw =>
       normaliseProduct(raw, mappings || [], markupRules || [], shippingTiers || [])
     ).filter(p => p.sku); // drop any product with no SKU
+
+    // ── OPT-IN: COUNT FORECAST STOCK (qty2) AS AVAILABLE ────────
+    // Per-supplier toggle (suppliers.count_forecast_stock). Off by default —
+    // only suppliers where you've confirmed their forecast window fits your
+    // fulfillment SLA (e.g. Mediamax dropship within 48h) should enable this.
+    // When on, stock_qty becomes max(actual qty, qty2 forecast) so the export
+    // filter's "Stock QTY > X" rule also passes on incoming-soon stock.
+    if (supplier.count_forecast_stock) {
+      let bumped = 0;
+      for (const p of normalised) {
+        const forecast = p.specs?.qty2_forecast;
+        if (forecast != null && forecast > (p.stock_qty || 0)) {
+          p.stock_qty = forecast;
+          bumped++;
+        }
+      }
+      if (bumped > 0) {
+        console.log(`[SYNC] ${supplier.name} — count_forecast_stock enabled: ${bumped} product(s) had stock_qty raised to their qty2 forecast`);
+      }
+    }
+
     if (rawProducts.length > 0) {
       console.log(`[SYNC] Sample raw product keys: ${JSON.stringify(Object.keys(rawProducts[0]))}`);
       console.log(`[SYNC] Sample raw product: ${JSON.stringify(rawProducts[0]).slice(0,400)}`);
