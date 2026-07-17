@@ -111,6 +111,18 @@ async function upsertBatch(config, products) {
   const toCreate = [];
   const toUpdate = []; // [{ odoo_id, values }]
 
+  // ── ODOO 17+ SCHEMA CHANGE ────────────────────────────────────
+  // Odoo <17: product.template.type accepted 'product' (storable),
+  // 'consu' (consumable), 'service'.
+  // Odoo 17+/19: 'product' was removed. Storable tracking is now a
+  // separate boolean field `is_storable` on top of type: 'consu'.
+  // Sending type: 'product' on v17+ throws:
+  //   ValueError: Wrong value for product.template.type: 'product'
+  const odooVersion = config.detected_version || 17;
+  const typeFields = odooVersion >= 17
+    ? { type: 'consu', is_storable: true }
+    : { type: 'product' };
+
   for (const product of products) {
     const values = {
       name:             product.name,
@@ -118,7 +130,7 @@ async function upsertBatch(config, products) {
       list_price:       product.sale_price  || 0,
       standard_price:   product.cost_price  || 0,
       description_sale: product.description || '',
-      type:             'product',
+      ...typeFields,
       // Supplier availability (cross-dock model) — NOT physical on-hand stock.
       // Requires custom Integer field x_supplier_qty on product.template in Odoo.
       ...(product.stock_qty != null ? { x_supplier_qty: product.stock_qty } : {}),
