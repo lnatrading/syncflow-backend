@@ -5,7 +5,7 @@ const axios       = require('axios');
 const { XMLParser } = require('fast-xml-parser');
 const { parse: csvParse } = require('csv-parse/sync');
 const odooClient  = require('./odooClient');
-const { loadFilterTree, evaluateProduct } = require('./filterEngine');
+const { loadFilterTree, evaluateProduct, getFilterBreakdown } = require('./filterEngine');
 const versionResolver = require('./apiVersionResolver');
 const { withRetry, sleep } = require('./retry');
 
@@ -447,6 +447,13 @@ async function runSupplierSync(supabase, supplier) {
     const filteredOut   = normalised.length - toExport.length;
     if (filteredOut > 0) {
       console.log(`[FILTER] ${supplier.name} — ${filteredOut} products blocked by export filter, ${toExport.length} will be pushed to Odoo`);
+      // Diagnostic: show which specific rule is doing the blocking,
+      // since the aggregate count alone doesn't say whether it's stock,
+      // price, or shipping class that's filtering out most products.
+      const breakdown = getFilterBreakdown(normalised, filterTree);
+      for (const b of breakdown) {
+        console.log(`[FILTER]   rule ${b.field} ${b.operator} ${JSON.stringify(b.value)} — fails ${b.failCount}, passes ${b.passCount}`);
+      }
     }
 
     // 11. PARALLEL ODOO PUSH — 5 concurrent batches of 100, with retry
