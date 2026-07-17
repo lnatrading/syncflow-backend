@@ -1769,11 +1769,18 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
     product.specs.outlet = raw.outlet;
   }
 
-  // qty2 / qty_2 (Mediamax 24h forecast stock) — store for reference
-  const qty2 = raw.qty2 ?? raw.qty_2;
+  // qty2 / qty_2 (Mediamax 24h forecast stock) — store for reference.
+  // mergeEndpointData()'s default case nests a secondary endpoint's row
+  // under raw._<role>Data (e.g. raw._otherData, raw._fast_updateData) —
+  // it does NOT flatten those fields onto raw itself. Checking only
+  // raw.qty2/raw.qty_2 silently missed every product merged this way,
+  // so qty2_forecast was never actually populated during a normal sync.
+  const qty2 = raw.qty2 ?? raw.qty_2
+             ?? raw._otherData?.qty2 ?? raw._otherData?.qty_2
+             ?? raw._fast_updateData?.qty2 ?? raw._fast_updateData?.qty_2;
   if (qty2 !== undefined) {
     product.specs = product.specs || {};
-    product.specs.qty2_forecast = qty2;
+    product.specs.qty2_forecast = parseInt(qty2, 10) || 0;
   }
 
   // Mediamax deeplink + stock-status flag (Feed de actualización lenta)
