@@ -98,6 +98,12 @@ async function runSupplierSync(supabase, supplier) {
     const productsUrl = versionResolver.resolveEndpointUrl(productsEndpoint, activeVersion);
     console.log(`[SYNC] ${supplier.name} — fetching products: ${productsUrl}`);
     let rawProducts = await fetchEndpoint(productsUrl, productsEndpoint.format, auth);
+    console.log(`[SYNC] ${supplier.name} — parsed ${rawProducts.length} product record(s)`);
+    if (rawProducts.length === 0) {
+      console.warn(`[SYNC] ${supplier.name} — 0 records after parsing. Check that the feed URL returns actual data (not an empty/placeholder file).`);
+    } else {
+      console.log(`[SYNC] ${supplier.name} — sample record keys: ${JSON.stringify(Object.keys(rawProducts[0]))}`);
+    }
 
     // Apply field renames from active API version
     rawProducts = versionResolver.transformProducts(rawProducts, activeVersion);
@@ -969,8 +975,13 @@ function parseResponse(raw, format) {
   try {
     // Guard: detect HTML error page returned with 200 OK.
     // This is a common API gateway failure mode (e.g. Cloudflare, nginx).
-    if (typeof raw === 'string' && raw.trimStart().startsWith('<html')) {
-      throw new Error('Supplier returned an HTML page instead of data — likely a gateway error or auth redirect. Check the endpoint URL and credentials.');
+    // Some servers (e.g. DCS) return "<!DOCTYPE html>" prefixed pages rather
+    // than starting directly with "<html" — check for both.
+    if (typeof raw === 'string') {
+      const head = raw.trimStart().slice(0, 20).toLowerCase();
+      if (head.startsWith('<html') || head.startsWith('<!doctype html')) {
+        throw new Error('Supplier returned an HTML page instead of data — likely a gateway error or auth redirect. Check the endpoint URL and credentials.');
+      }
     }
 
     if (format === 'json') {
@@ -983,6 +994,19 @@ function parseResponse(raw, format) {
 
     if (format === 'csv') {
       return csvParse(raw, { columns: true, skip_empty_lines: true, trim: true });
+    }
+
+    // DCS (and other EU suppliers): semicolon-separated CSV
+    // Common in Danish/European feeds where comma is the decimal separator
+    if (format === 'csv_semicolon') {
+      return csvParse(raw, {
+        columns:               true,
+        skip_empty_lines:      true,
+        trim:                  true,
+        delimiter:             ';',
+        relax_column_count:    true,
+        skip_records_with_error: true,
+      });
     }
 
     // Mediamax B2B feeds: pipe-separated, single-quote string delimiter
