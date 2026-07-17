@@ -129,13 +129,32 @@ async function routeAndPlace(supabase, odooOrder) {
     });
   }
 
-  // 3. Create supplier_order rows and place each one (cross-dock: always ship to warehouse)
+  // 3. Create supplier_order rows and place each one.
+  //    Address selection depends on each supplier's fulfillment_model:
+  //      - cross_dock (default): supplier ships to our warehouse, we
+  //        forward to the customer ourselves — unchanged behaviour.
+  //      - dropship: supplier ships directly to the end customer.
+  //        Billing still goes to us (the supplier invoices our company),
+  //        only the shipping/delivery address changes.
+  //    Falls back to warehouse shipping if dropship is selected but we
+  //    don't actually have a usable customer address — sending an empty
+  //    address to a real supplier is worse than defaulting to cross-dock.
   const results = [];
   for (const [supplierId, bucket] of Object.entries(supplierBuckets)) {
+    const isDropship = bucket.supplier?.fulfillment_model === 'dropship';
+    const hasCustomerAddress = !!(customerAddress?.street && customerAddress?.city);
+
+    let shipTo = warehouseAddress;
+    if (isDropship && hasCustomerAddress) {
+      shipTo = customerAddress;
+    } else if (isDropship && !hasCustomerAddress) {
+      console.warn(`[ROUTER] ${bucket.supplier?.name} is dropship but no usable customer address on ${odooOrder.odoo_sale_ref} — falling back to warehouse shipping`);
+    }
+
     const result = await placeSingleSupplierOrder(supabase, {
       ...odooOrder,
-      shipping_address: warehouseAddress,
-      billing_address:  warehouseAddress,
+      shipping_address: shipTo,
+      billing_address:  warehouseAddress, // we're always the bill-to, regardless of fulfillment model
       customer_address: customerAddress,
     }, supplierId, bucket);
     results.push(result);
