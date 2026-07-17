@@ -38,6 +38,39 @@ function evaluateProduct(product, filterTree) {
   return evaluateGroup(product, filterTree.rootGroup);
 }
 
+// ── DIAGNOSTIC: PER-RULE FAIL BREAKDOWN ──────────────────────
+// Answers "which specific rule is blocking most products?" instead of
+// only the aggregate pass/fail count. Walks every rule in the tree
+// (including nested groups) and reports how many products fail that
+// rule in isolation — independent of the other rules in the group.
+// This is diagnostic only; it does not change which products export.
+function getFilterBreakdown(products, filterTree) {
+  if (!filterTree) return [];
+
+  const rows = [];
+  collectRules(filterTree.rootGroup, rows);
+
+  return rows.map(({ rule, path }) => {
+    let fail = 0;
+    for (const p of products) {
+      if (!evaluateRule(p, rule)) fail++;
+    }
+    return {
+      path,
+      field:    rule.field,
+      operator: rule.operator,
+      value:    rule.value ?? rule.values_json ?? null,
+      failCount: fail,
+      passCount: products.length - fail,
+    };
+  });
+}
+
+function collectRules(group, rows, path = 'root') {
+  for (const rule of group.rules) rows.push({ rule, path });
+  for (const child of group.children) collectRules(child, rows, `${path}>${child.id}`);
+}
+
 // ── EVALUATE A GROUP ─────────────────────────────────────────
 function evaluateGroup(product, group) {
   const op   = (group.logic_op || 'AND').toUpperCase();
@@ -154,4 +187,4 @@ function parseValues(valuesJson) {
   catch { return []; }
 }
 
-module.exports = { loadFilterTree, evaluateProduct };
+module.exports = { loadFilterTree, evaluateProduct, getFilterBreakdown };
