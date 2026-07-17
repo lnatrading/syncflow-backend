@@ -454,6 +454,18 @@ async function runSupplierSync(supabase, supplier) {
       for (const b of breakdown) {
         console.log(`[FILTER]   rule ${b.field} ${b.operator} ${JSON.stringify(b.value)} — fails ${b.failCount}, passes ${b.passCount}`);
       }
+      // ── STRATEGIC DIAGNOSTIC (one-off) ──────────────────────────
+      // Not a filter change — just measuring impact before deciding
+      // whether to count Mediamax's qty2 (24h forecast stock) as
+      // available. Compares current stock_qty>1 pass count against
+      // what it would be if qty2 were counted too (max of the two).
+      const stockRule = breakdown.find(b => b.field === 'stock_qty');
+      if (stockRule) {
+        const withQty2 = normalised.filter(p =>
+          Math.max(p.stock_qty || 0, p.specs?.qty2_forecast || 0) > 1
+        ).length;
+        console.log(`[FILTER]   diagnostic: stock_qty>1 currently passes ${stockRule.passCount}; would pass ${withQty2} if qty2 (24h forecast) also counted as stock`);
+      }
     }
 
     // 11. PARALLEL ODOO PUSH — 5 concurrent batches of 100, with retry
