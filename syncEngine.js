@@ -1433,6 +1433,88 @@ function applyShippingTiers(dims, rules) {
   return { shippingClass, shippingCost };
 }
 
+// ── PRICING RULE HELPERS ─────────────────────────────────────
+// Category filter: matches any category if the rule has none set.
+function matchesCategoryFilter(product, rule) {
+  if (!rule.category) return true;
+  return !!(product.category && product.category.toLowerCase().includes(rule.category.toLowerCase()));
+}
+
+// Condition evaluation for the IF side of a pricing rule.
+function matchesMarkupCondition(product, rule) {
+  const field = rule.condition_field || 'always';
+  if (field === 'always') return true;
+
+  const op  = rule.condition_op || 'gt';
+  const val = rule.condition_value;
+
+  const raw = field === 'category'   ? product.category
+            : field === 'cost_price' ? product.cost_price
+            : field === 'stock_qty'  ? product.stock_qty
+            : field === 'brand'      ? product.brand
+            : field === 'name'       ? product.name
+            : product[field];
+
+  switch (op) {
+    case 'gt':  return toNumSafe(raw) >  toNumSafe(val);
+    case 'lt':  return toNumSafe(raw) <  toNumSafe(val);
+    case 'gte': return toNumSafe(raw) >= toNumSafe(val);
+    case 'lte': return toNumSafe(raw) <= toNumSafe(val);
+    case 'eq': {
+      const a = parseFloat(raw), b = parseFloat(val);
+      if (!isNaN(a) && !isNaN(b)) return Math.abs(a - b) < 0.0001;
+      return String(raw ?? '').toLowerCase() === String(val ?? '').toLowerCase();
+    }
+    case 'contains':
+      return String(raw ?? '').toLowerCase().includes(String(val ?? '').toLowerCase());
+    default:
+      return true;
+  }
+}
+
+function toNumSafe(v) {
+  const n = parseFloat(v);
+  return isNaN(n) ? 0 : n;
+}
+
+// Action evaluation for the THEN side of a pricing rule.
+// action_value / markup_pct hold the numeric input depending on the field
+// the UI wrote to (older rows use markup_pct even for non-% actions).
+function applyPricingAction(product, rule) {
+  const cost   = product.cost_price || 0;
+  const action = rule.action_type || 'markup_pct';
+  const value  = parseFloat(rule.markup_pct ?? rule.action_value ?? 0) || 0;
+
+  let price;
+  switch (action) {
+    case 'markup_pct':
+      price = cost * (1 + value / 100);
+      break;
+    case 'markup_fixed':
+      price = cost + value;
+      break;
+    case 'set_price':
+      price = value;
+      break;
+    case 'round_to': {
+      // Round the current computed price (or cost, if none yet) up to the
+      // nearest multiple of `value` — e.g. round_to 5 → nearest €5;
+      // round_to 0.99 → psychological pricing (X9.99 style needs a
+      // separate offset, this covers plain rounding).
+      const base = product.sale_price || cost;
+      const step = value > 0 ? value : 1;
+      price = Math.ceil(base / step) * step;
+      break;
+    }
+    default:
+      price = cost * (1 + value / 100);
+  }
+
+  if (rule.shipping_add) price += parseFloat(rule.shipping_add) || 0;
+
+  return parseFloat(price.toFixed(2));
+}
+
 function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
   const product = {};
 
@@ -1678,15 +1760,28 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
     product.warranty = w ? (typeof w === 'object' ? (w.value || w['#text'] || null) : String(w)) : null;
   }
 
-  // Markup rules
+  // ── PRICING RULES ENGINE ─────────────────────────────────────
+  // Honors the full IF/THEN rule builder from the UI:
+  //   condition_field ('always'|'category'|'cost_price'|'stock_qty'|'brand'|'name')
+  //   condition_op     ('gt'|'lt'|'gte'|'lte'|'eq'|'contains')
+  //   condition_value
+  //   action_type      ('markup_pct'|'markup_fixed'|'set_price'|'round_to')
+  //   markup_pct / action_value, shipping_add
+  // Previously only `category` (plain substring) + `markup_pct` were read —
+  // everything else saved fine in the UI but was silently ignored here.
   if (markupRules.length && product.cost_price) {
-    const rule = markupRules.find(r =>
-      r.category && product.category &&
-      product.category.toLowerCase().includes(r.category.toLowerCase())
-    ) || markupRules.find(r => !r.category);
+    const specificRule = markupRules.find(r =>
+      (r.category || (r.condition_field && r.condition_field !== 'always')) &&
+      matchesCategoryFilter(product, r) &&
+      matchesMarkupCondition(product, r)
+    );
+    const fallbackRule = markupRules.find(r =>
+      !r.category && (!r.condition_field || r.condition_field === 'always')
+    );
+    const rule = specificRule || fallbackRule;
 
     if (rule) {
-      product.sale_price = parseFloat((product.cost_price * (1 + parseFloat(rule.markup_pct) / 100)).toFixed(2));
+      product.sale_price = applyPricingAction(product, rule);
     }
   }
 
