@@ -28,4 +28,28 @@ router.get('/:id', async (req, res) => {
   res.json(data);
 });
 
+// DELETE a single product — the frontend's ✕ button already calls this,
+// but the route never existed on the backend until now.
+router.delete('/:id', async (req, res) => {
+  const { error } = await req.sb.from('products').delete().eq('id', req.params.id);
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true });
+});
+
+// DELETE all zero-stock products, optionally scoped to one supplier.
+// Meant for one-off cleanup of the stale zero-stock rows that
+// accumulated before we started skipping new zero-stock imports —
+// existing zero-stock rows still get upserted normally by the sync
+// engine, they just never get inserted fresh anymore.
+router.delete('/bulk/zero-stock', async (req, res) => {
+  const supplierId = req.query.supplier_id || req.body?.supplier_id;
+
+  let q = req.sb.from('products').delete({ count: 'exact' }).lte('stock_qty', 0);
+  if (supplierId) q = q.eq('supplier_id', supplierId);
+
+  const { error, count } = await q;
+  if (error) return res.status(500).json({ error: error.message });
+  res.json({ success: true, deleted: count ?? 0 });
+});
+
 module.exports = router;
