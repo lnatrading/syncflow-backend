@@ -192,6 +192,27 @@ async function runSupplierSync(supabase, supplier) {
       }
     }
 
+    // ── SKIP *NEW* ZERO-STOCK PRODUCTS BEFORE UPSERT ────────────
+    // Skips inserting brand-new rows for products with no stock — no
+    // point importing something you can't sell yet. But products that
+    // already exist in Supabase from a prior sync are NEVER skipped
+    // here, even at zero stock: if we silently dropped them, a product
+    // going out of stock would keep its old, stale stock_qty in the
+    // database forever, since nothing would ever write the 0 to
+    // overwrite it. One lookup query, not per-row, to keep this cheap.
+    const beforeStockFilter = normalised.length;
+    const { data: existingSkuRows } = await supabase
+      .from('products')
+      .select('sku')
+      .eq('supplier_id', supplier.id);
+    const existingSkus = new Set((existingSkuRows || []).map(r => r.sku));
+
+    normalised = normalised.filter(p => (p.stock_qty || 0) > 0 || existingSkus.has(p.sku));
+    const skippedZeroStock = beforeStockFilter - normalised.length;
+    if (skippedZeroStock > 0) {
+      console.log(`[SYNC] ${supplier.name} — skipped ${skippedZeroStock} new zero-stock product(s), not importing them (existing zero-stock products are still updated normally)`);
+    }
+
     if (rawProducts.length > 0) {
       console.log(`[SYNC] Sample raw product keys: ${JSON.stringify(Object.keys(rawProducts[0]))}`);
       console.log(`[SYNC] Sample raw product: ${JSON.stringify(rawProducts[0]).slice(0,400)}`);
