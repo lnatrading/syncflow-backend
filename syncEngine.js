@@ -199,13 +199,30 @@ async function runSupplierSync(supabase, supplier) {
     // here, even at zero stock: if we silently dropped them, a product
     // going out of stock would keep its old, stale stock_qty in the
     // database forever, since nothing would ever write the 0 to
-    // overwrite it. One lookup query, not per-row, to keep this cheap.
+    // overwrite it.
+    //
+    // Only checks existence for THIS batch's zero-stock SKUs — not the
+    // supplier's whole catalog. The first version of this fetched every
+    // existing SKU (e.g. all 177k for DCS) on every single sync for
+    // every supplier, which added enough extra query load to start
+    // causing statement timeouts across the board (every supplier
+    // showing 'partial' status). Scoping to just the zero-stock subset
+    // keeps this cheap regardless of total catalogue size.
     const beforeStockFilter = normalised.length;
-    const { data: existingSkuRows } = await supabase
-      .from('products')
-      .select('sku')
-      .eq('supplier_id', supplier.id);
-    const existingSkus = new Set((existingSkuRows || []).map(r => r.sku));
+    const zeroStockSkus = normalised.filter(p => (p.stock_qty || 0) <= 0).map(p => p.sku);
+    const existingSkus = new Set();
+
+    if (zeroStockSkus.length > 0) {
+      for (let i = 0; i < zeroStockSkus.length; i += 500) {
+        const skuChunk = zeroStockSkus.slice(i, i + 500);
+        const { data: rows } = await supabase
+          .from('products')
+          .select('sku')
+          .eq('supplier_id', supplier.id)
+          .in('sku', skuChunk);
+        (rows || []).forEach(r => existingSkus.add(r.sku));
+      }
+    }
 
     normalised = normalised.filter(p => (p.stock_qty || 0) > 0 || existingSkus.has(p.sku));
     const skippedZeroStock = beforeStockFilter - normalised.length;
@@ -443,12 +460,36 @@ async function runSupplierSync(supabase, supplier) {
         last_synced: new Date(),
       }));
 
-      const { error: e } = await supabase
-        .from('products')
-        .upsert(rows, { onConflict: 'supplier_id,sku', ignoreDuplicates: false });
+      // Retry transient failures (statement timeout, connection blips,
+      // deadlocks) up to 3 attempts before counting the chunk as failed.
+      // A genuine schema/data error would fail identically on every
+      // retry, so those are flagged noRetry to fail fast instead of
+      // wasting 2 extra attempts on something that can never succeed.
+      let upsertError = null;
+      try {
+        await withRetry(async () => {
+          const { error: e } = await supabase
+            .from('products')
+            .upsert(rows, { onConflict: 'supplier_id,sku', ignoreDuplicates: false });
+          if (e) {
+            const err = new Error(e.message);
+            if (!/timeout|deadlock|connection|ECONNRESET|ETIMEDOUT/i.test(e.message)) {
+              err.noRetry = true;
+            }
+            throw err;
+          }
+        }, {
+          maxAttempts: 3,
+          baseDelayMs: 2000,
+          multiplier:  2,     // 2s → 4s
+          label:       `${supplier.name} upsert chunk @${i}`,
+        });
+      } catch (err) {
+        upsertError = err;
+      }
 
-      if (e) {
-        console.error('[SUPABASE] upsert error:', e.message);
+      if (upsertError) {
+        console.error('[SUPABASE] upsert error:', upsertError.message);
         errors += chunk.length;
       } else {
         updated += chunk.length; // we can't tell insert vs update with upsert — treat as updated
