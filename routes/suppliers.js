@@ -146,9 +146,35 @@ router.post('/:id/sync', async (req, res) => {
     .single();
   if (error || !supplier) return res.status(404).json({ error: 'Supplier not found' });
 
+  if (supplier.is_syncing) {
+    return res.status(409).json({ error: `${supplier.name} is already syncing — wait for it to finish before triggering another run.` });
+  }
+
+  // Acquire the same distributed lock the cron scheduler uses. Without
+  // this, this route never set is_syncing, so the cron job (which checks
+  // is_syncing before launching) couldn't see a manual sync in progress —
+  // it would happily start a SECOND, fully concurrent sync on its next
+  // tick, both racing to upsert the same rows and causing Supabase
+  // statement-timeout errors from lock contention.
+  const { error: lockErr } = await req.sb
+    .from('suppliers')
+    .update({ is_syncing: true, last_sync: new Date() })
+    .eq('id', supplier.id)
+    .eq('is_syncing', false); // conditional — avoids a race with a cron tick firing at the same instant
+
+  if (lockErr) {
+    return res.status(500).json({ error: `Could not lock ${supplier.name} for sync: ${lockErr.message}` });
+  }
+
   // Mark as manual so syncEngine bypasses the per-endpoint frequency gate
   supplier._force = true;
-  syncEngine.runSupplierSync(req.sb, supplier).catch(console.error);
+  supplier.is_syncing = true;
+  syncEngine.runSupplierSync(req.sb, supplier)
+    .catch(console.error)
+    .finally(async () => {
+      await req.sb.from('suppliers').update({ is_syncing: false }).eq('id', supplier.id);
+    });
+
   res.json({ message: `Sync started for ${supplier.name}` });
 });
 
