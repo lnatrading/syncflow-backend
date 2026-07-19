@@ -41,15 +41,39 @@ router.delete('/:id', async (req, res) => {
 // accumulated before we started skipping new zero-stock imports —
 // existing zero-stock rows still get upserted normally by the sync
 // engine, they just never get inserted fresh anymore.
+//
+// Deletes in small chunks rather than one giant DELETE statement —
+// a single statement against thousands of rows was hitting Supabase's
+// statement timeout, the same failure mode we saw on the sync upsert.
 router.delete('/bulk/zero-stock', async (req, res) => {
   const supplierId = req.query.supplier_id || req.body?.supplier_id;
+  const CHUNK = 300;
+  let totalDeleted = 0;
 
-  let q = req.sb.from('products').delete({ count: 'exact' }).lte('stock_qty', 0);
-  if (supplierId) q = q.eq('supplier_id', supplierId);
+  try {
+    while (true) {
+      let selQ = req.sb.from('products').select('id').lte('stock_qty', 0).limit(CHUNK);
+      if (supplierId) selQ = selQ.eq('supplier_id', supplierId);
+      const { data: rows, error: selErr } = await selQ;
+      if (selErr) throw selErr;
+      if (!rows || rows.length === 0) break;
 
-  const { error, count } = await q;
-  if (error) return res.status(500).json({ error: error.message });
-  res.json({ success: true, deleted: count ?? 0 });
+      const ids = rows.map(r => r.id);
+      const { error: delErr } = await req.sb.from('products').delete().in('id', ids);
+      if (delErr) throw delErr;
+
+      totalDeleted += ids.length;
+      if (rows.length < CHUNK) break; // reached the last page
+
+      // Small pause between chunks, same reasoning as the sync upsert —
+      // avoids hammering Supabase with back-to-back write statements.
+      await new Promise(r => setTimeout(r, 150));
+    }
+    res.json({ success: true, deleted: totalDeleted });
+  } catch (err) {
+    // Report partial progress — useful if a very large cleanup dies partway
+    res.status(500).json({ error: err.message, deleted: totalDeleted });
+  }
 });
 
 module.exports = router;
