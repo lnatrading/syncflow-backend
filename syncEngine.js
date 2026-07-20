@@ -168,9 +168,56 @@ async function runSupplierSync(supabase, supplier) {
     const shippingTiers = _shippingRaw || [];
 
     // 6. Normalise all products
-    let normalised = rawProducts.map(raw =>
+    let normalisedFull = rawProducts.map(raw =>
       normaliseProduct(raw, mappings || [], markupRules || [], shippingTiers || [])
-    ).filter(p => p.sku); // drop any product with no SKU
+    );
+
+    // ── APPLY MY ATTRIBUTES MAPPING ─────────────────────────────
+    // supplier_attributes/my_attributes let you map each of a supplier's
+    // raw column names (populated by discoverAttributes below) to one
+    // canonical attribute name shared across every supplier. Previously
+    // this mapping was purely cosmetic — set in the UI but never actually
+    // applied to synced products. From here on, any raw column that's
+    // been mapped gets copied into product.specs under its canonical
+    // name, so e.g. Mediamax's "Item_Type" and DCS's "Warranty" column
+    // can both end up under one consistent spec key across suppliers.
+    // Must run here, while rawProducts[i] and normalisedFull[i] are still
+    // guaranteed to be the same product at the same index — the SKU
+    // filter right after this breaks that 1:1 alignment.
+    try {
+      const { data: attrMappings } = await supabase
+        .from('supplier_attributes')
+        .select('name, my_attributes(name)')
+        .eq('supplier_id', supplier.id)
+        .not('my_attribute_id', 'is', null);
+
+      if (attrMappings && attrMappings.length > 0) {
+        let appliedCount = 0;
+        for (let i = 0; i < rawProducts.length; i++) {
+          const raw     = rawProducts[i];
+          const product = normalisedFull[i];
+          if (!product) continue;
+          let touched = false;
+          for (const m of attrMappings) {
+            const canonicalName = m.my_attributes?.name;
+            if (!canonicalName) continue;
+            const rawVal = raw[m.name];
+            if (rawVal === undefined || rawVal === null || rawVal === '') continue;
+            product.specs = product.specs || {};
+            product.specs[canonicalName] = rawVal;
+            touched = true;
+          }
+          if (touched) appliedCount++;
+        }
+        if (appliedCount > 0) {
+          console.log(`[SYNC] ${supplier.name} — applied My Attributes mapping to ${appliedCount} product(s)`);
+        }
+      }
+    } catch (e) {
+      console.warn('[SYNC] My Attributes mapping lookup failed:', e.message);
+    }
+
+    let normalised = normalisedFull.filter(p => p.sku); // drop any product with no SKU
 
     // ── OPT-IN: COUNT FORECAST STOCK (qty2) AS AVAILABLE ────────
     // Per-supplier toggle (suppliers.count_forecast_stock). Off by default —
@@ -306,6 +353,78 @@ async function runSupplierSync(supabase, supplier) {
           console.log(`[SYNC] Category counts updated: ${updated}/${existingCats.length} with product counts`);
         }
       } catch(e) { console.warn('[SYNC] Category count update failed:', e.message); }
+    }
+
+    // 6d. Derive supplier_categories directly from THIS sync's products for
+    // any supplier that has no dedicated categories feed (e.g. Mediamax,
+    // DCS — they only send inline category/subcategory columns on each
+    // product row, never a separate categories endpoint). Without this,
+    // supplier_categories stayed permanently empty for these suppliers,
+    // so the My Categories mapping UI had nothing to map even though the
+    // feature exists and works for suppliers like TD Baltic.
+    if (normalised.length > 0) {
+      try {
+        const derivedPaths = new Map(); // path -> name
+        for (const p of normalised) {
+          if (!p.category) continue;
+          const path = p.subcategory ? `${p.category} > ${p.subcategory}` : p.category;
+          if (!derivedPaths.has(path)) derivedPaths.set(path, p.subcategory || p.category);
+        }
+        if (derivedPaths.size > 0) {
+          const rows = [...derivedPaths.entries()].map(([path, name]) => ({
+            supplier_id: supplier.id,
+            external_id: null,
+            path,
+            name,
+          }));
+          await supabase.from('supplier_categories')
+            .upsert(rows, { onConflict: 'supplier_id,path', ignoreDuplicates: true });
+          console.log(`[SYNC] ${supplier.name} — derived ${rows.length} distinct categor${rows.length === 1 ? 'y' : 'ies'} from products for the My Categories mapping UI`);
+        }
+      } catch (e) {
+        console.warn('[SYNC] Derived category upsert failed:', e.message);
+      }
+    }
+
+    // 6e. Apply My Category mapping. Previously, mapping a supplier
+    // category to a My Category in the UI had zero effect on the actual
+    // synced products — nothing ever read my_category_id back. From here
+    // on, any product whose raw category/subcategory path has been mapped
+    // gets its product.category overridden with the unified label, so
+    // markup rules, export filters, and future Odoo category assignment
+    // all see one consistent taxonomy instead of each supplier's own
+    // wording. The original supplier wording is preserved in
+    // specs.raw_category for reference.
+    try {
+      const { data: mappedCats } = await supabase
+        .from('supplier_categories')
+        .select('path, my_categories(label)')
+        .eq('supplier_id', supplier.id)
+        .not('my_category_id', 'is', null);
+
+      if (mappedCats && mappedCats.length > 0) {
+        const byPath = new Map();
+        for (const c of mappedCats) {
+          if (c.my_categories?.label) byPath.set(c.path, c.my_categories.label);
+        }
+        let remapped = 0;
+        for (const p of normalised) {
+          if (!p.category) continue;
+          const path = p.subcategory ? `${p.category} > ${p.subcategory}` : p.category;
+          const unified = byPath.get(path);
+          if (unified) {
+            p.specs = p.specs || {};
+            p.specs.raw_category = p.category;
+            p.category = unified;
+            remapped++;
+          }
+        }
+        if (remapped > 0) {
+          console.log(`[SYNC] ${supplier.name} — applied My Category mapping to ${remapped} product(s)`);
+        }
+      }
+    } catch (e) {
+      console.warn('[SYNC] My Category mapping lookup failed:', e.message);
     }
 
     // 7. Fetch parameterised endpoints (e.g. Elko per-product description URLs).
