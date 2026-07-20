@@ -325,43 +325,16 @@ async function runSupplierSync(supabase, supplier) {
       }
     }
 
-    // 6c. Update category product counts — runs AFTER discoverCategories to avoid being overwritten
-    if (normalised.length > 0) {
-      try {
-        const catCounts = {};
-        for (const p of normalised) {
-          if (p.category) catCounts[p.category] = (catCounts[p.category] || 0) + 1;
-        }
-        const { data: existingCats } = await supabase.from('supplier_categories')
-          .select('id, name, external_id').eq('supplier_id', supplier.id);
-        if (existingCats) {
-          const catCountsLower = {};
-          for (const [k,v] of Object.entries(catCounts)) catCountsLower[k.toLowerCase()] = v;
-          let updated = 0;
-          const BATCH = 50;
-          for (let i = 0; i < existingCats.length; i += BATCH) {
-            const batch = existingCats.slice(i, i + BATCH);
-            await Promise.all(batch.map(cat => {
-              const count = catCounts[cat.name] || catCounts[cat.external_id]
-                         || catCountsLower[cat.name?.toLowerCase()] || catCountsLower[cat.external_id?.toLowerCase()]
-                         || 0;
-              if (count > 0) updated++;
-              return supabase.from('supplier_categories')
-                .update({ product_count: count }).eq('id', cat.id);
-            }));
-          }
-          console.log(`[SYNC] Category counts updated: ${updated}/${existingCats.length} with product counts`);
-        }
-      } catch(e) { console.warn('[SYNC] Category count update failed:', e.message); }
-    }
-
-    // 6d. Derive supplier_categories directly from THIS sync's products for
+    // 6c. Derive supplier_categories directly from THIS sync's products for
     // any supplier that has no dedicated categories feed (e.g. Mediamax,
     // DCS — they only send inline category/subcategory columns on each
     // product row, never a separate categories endpoint). Without this,
     // supplier_categories stayed permanently empty for these suppliers,
     // so the My Categories mapping UI had nothing to map even though the
     // feature exists and works for suppliers like TD Baltic.
+    // Runs BEFORE the count-update step below so newly-derived subcategory
+    // rows get their product_count populated in this same sync, instead
+    // of staying at 0 until the next run.
     if (normalised.length > 0) {
       try {
         const derivedPaths = new Map(); // path -> name
@@ -384,6 +357,42 @@ async function runSupplierSync(supabase, supplier) {
       } catch (e) {
         console.warn('[SYNC] Derived category upsert failed:', e.message);
       }
+    }
+
+    // 6d. Update category product counts.
+    // FIX: previously keyed by p.category alone (e.g. "Hardware") and
+    // matched against cat.name/cat.external_id — but a subcategory row's
+    // name is just the child label (e.g. "Desktop Memory"), which never
+    // equals the parent category name, so every subcategory-level count
+    // stayed at 0 regardless of how many products it actually had. Now
+    // keyed by the SAME full path ("Category > Subcategory") used
+    // everywhere else in this file (6c derivation, 6e mapping, and TD
+    // Baltic's discoverCategories), matched directly against cat.path.
+    if (normalised.length > 0) {
+      try {
+        const catCounts = {};
+        for (const p of normalised) {
+          if (!p.category) continue;
+          const path = p.subcategory ? `${p.category} > ${p.subcategory}` : p.category;
+          catCounts[path] = (catCounts[path] || 0) + 1;
+        }
+        const { data: existingCats } = await supabase.from('supplier_categories')
+          .select('id, path').eq('supplier_id', supplier.id);
+        if (existingCats) {
+          let updated = 0;
+          const BATCH = 50;
+          for (let i = 0; i < existingCats.length; i += BATCH) {
+            const batch = existingCats.slice(i, i + BATCH);
+            await Promise.all(batch.map(cat => {
+              const count = catCounts[cat.path] || 0;
+              if (count > 0) updated++;
+              return supabase.from('supplier_categories')
+                .update({ product_count: count }).eq('id', cat.id);
+            }));
+          }
+          console.log(`[SYNC] Category counts updated: ${updated}/${existingCats.length} with product counts`);
+        }
+      } catch(e) { console.warn('[SYNC] Category count update failed:', e.message); }
     }
 
     // 6e. Apply My Category mapping. Previously, mapping a supplier
