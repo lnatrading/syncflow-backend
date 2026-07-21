@@ -137,6 +137,15 @@ async function upsertBatch(config, products) {
       // Image stored as URL, not Base64 binary — prevents database bloat.
       // Requires custom Char field x_image_url on product.template in Odoo.
       ...(product.image_url ? { x_image_url: product.image_url } : {}),
+      // Human-readable spec summary built from mapped My Attributes (e.g.
+      // "Product Type: Smartphone | Condition: New | Warranty: 24 months").
+      // ONE generic field for ALL mapped attributes, deliberately — a
+      // separate custom Odoo field per attribute doesn't scale, since
+      // every new attribute mapped in Syncflow would require another trip
+      // into Odoo Studio. This field just grows richer automatically as
+      // more attributes get mapped, no Odoo-side changes ever needed again.
+      // Requires custom Text field x_specifications on product.template in Odoo.
+      ...(product.specs_summary ? { x_specifications: product.specs_summary } : {}),
     };
 
     if (existingBySku[product.sku]) {
@@ -147,12 +156,20 @@ async function upsertBatch(config, products) {
   }
 
   // ── Step 2: Create all new products in one call ──────────────────────────
+  const skuToOdooId = {};
+  for (const { odoo_id, values } of toUpdate) {
+    skuToOdooId[values.default_code] = odoo_id;
+  }
+
   if (toCreate.length) {
-    await call(object, 'execute_kw', [
+    const newIds = await call(object, 'execute_kw', [
       config.database, uid, config.api_key,
       'product.template', 'create',
       [toCreate]
     ]);
+    // Odoo's create() returns new IDs in the same order as the input list —
+    // zip them back to the SKUs that were just created.
+    newIds.forEach((id, i) => { skuToOdooId[toCreate[i].default_code] = id; });
   }
 
   // ── Step 3: Update existing products ────────────────────────────────────
@@ -165,7 +182,94 @@ async function upsertBatch(config, products) {
     ]).catch(e => console.error(`[ODOO] write failed for id ${odoo_id}:`, e.message));
   }
 
-  return { created: toCreate.length, updated: toUpdate.length };
+  return { created: toCreate.length, updated: toUpdate.length, skuToOdooId };
+}
+
+// ── VENDOR (SUPPLIER) TRACKING — Odoo's native mechanism ──────
+// Instead of a custom text field, this uses Odoo's built-in Vendor
+// system: each Syncflow supplier becomes a real res.partner marked as
+// a vendor, and each product gets a product.supplierinfo line linking
+// it to that vendor with the current cost price. This shows up
+// natively in the product's "Purchase" tab and plugs into Odoo's own
+// vendor pricing / RFQ features — not just a display label.
+
+// Finds an existing vendor contact by name, or creates one if it
+// doesn't exist yet. Call once per supplier and cache the returned id
+// (e.g. on the suppliers table) — no need to look this up every sync.
+async function getOrCreateVendorPartner(config, supplierName) {
+  const uid = await authenticate(config);
+  const { object } = getClients(config.url);
+
+  const existing = await call(object, 'execute_kw', [
+    config.database, uid, config.api_key,
+    'res.partner', 'search_read',
+    [[['name', '=', supplierName], ['supplier_rank', '>', 0]]],
+    { fields: ['id'], limit: 1 }
+  ]);
+  if (existing.length) return existing[0].id;
+
+  const [newId] = await call(object, 'execute_kw', [
+    config.database, uid, config.api_key,
+    'res.partner', 'create',
+    [[{ name: supplierName, company_type: 'company', supplier_rank: 1 }]]
+  ]);
+  return newId;
+}
+
+// Upserts a product.supplierinfo record (product_tmpl_id + partner_id)
+// for each product, setting its current cost price. Idempotent — an
+// existing line for the same product+vendor gets its price updated
+// rather than a duplicate line being created every sync.
+//   items: [{ odoo_id, cost_price, sku }]
+async function syncVendorPricing(config, partnerId, items) {
+  if (!partnerId || !items.length) return { created: 0, updated: 0 };
+  const uid = await authenticate(config);
+  const { object } = getClients(config.url);
+
+  const templateIds = items.map(i => i.odoo_id).filter(Boolean);
+  if (!templateIds.length) return { created: 0, updated: 0 };
+
+  const existing = await call(object, 'execute_kw', [
+    config.database, uid, config.api_key,
+    'product.supplierinfo', 'search_read',
+    [[['partner_id', '=', partnerId], ['product_tmpl_id', 'in', templateIds]]],
+    { fields: ['id', 'product_tmpl_id'] }
+  ]);
+  // search_read returns product_tmpl_id as [id, display_name] — flatten to id
+  const existingByTemplateId = Object.fromEntries(
+    existing.map(r => [Array.isArray(r.product_tmpl_id) ? r.product_tmpl_id[0] : r.product_tmpl_id, r.id])
+  );
+
+  let created = 0, updated = 0;
+  const toCreate = [];
+
+  for (const item of items) {
+    if (!item.odoo_id) continue;
+    const price = item.cost_price || 0;
+    const supplierinfoId = existingByTemplateId[item.odoo_id];
+
+    if (supplierinfoId) {
+      await call(object, 'execute_kw', [
+        config.database, uid, config.api_key,
+        'product.supplierinfo', 'write',
+        [[supplierinfoId], { price }]
+      ]).catch(e => console.error(`[ODOO] supplierinfo write failed for template ${item.odoo_id}:`, e.message));
+      updated++;
+    } else {
+      toCreate.push({ partner_id: partnerId, product_tmpl_id: item.odoo_id, price, min_qty: 1 });
+    }
+  }
+
+  if (toCreate.length) {
+    await call(object, 'execute_kw', [
+      config.database, uid, config.api_key,
+      'product.supplierinfo', 'create',
+      [toCreate]
+    ]).catch(e => console.error('[ODOO] supplierinfo create failed:', e.message));
+    created = toCreate.length;
+  }
+
+  return { created, updated };
 }
 
 // ── PUSH TRACKING NUMBER TO ODOO SALE ORDER ───────────────────
@@ -412,4 +516,4 @@ async function createInboundReceipt(config, { odoo_sale_ref, odoo_po_id, waybill
   }
 }
 
-module.exports = { testConnection, upsertBatch, authenticate, updateOrderTracking, updateInboundTracking, createPurchaseOrder, createVendorBill, createInboundReceipt };
+module.exports = { testConnection, upsertBatch, authenticate, updateOrderTracking, updateInboundTracking, createPurchaseOrder, createVendorBill, createInboundReceipt, getOrCreateVendorPartner, syncVendorPricing };
