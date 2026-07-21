@@ -171,7 +171,13 @@ function getProductField(product, field) {
     case 'height_cm':      return product.height_cm;
     case 'depth_cm':       return product.depth_cm;
     default:
-      return product[field] ?? null;
+      // My Attributes mapping stores values under product.specs[canonicalName],
+      // not as a top-level property — check there first. Without this, any
+      // export filter rule referencing a mapped attribute (e.g. "Warranty")
+      // silently evaluated against undefined and always failed, since the
+      // frontend already lets you pick these from the field dropdown but
+      // this lookup never actually looked inside specs.
+      return product.specs?.[field] ?? product[field] ?? null;
   }
 }
 
