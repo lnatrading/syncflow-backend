@@ -187,7 +187,7 @@ async function runSupplierSync(supabase, supplier) {
     try {
       const { data: attrMappings } = await supabase
         .from('supplier_attributes')
-        .select('name, my_attributes(name)')
+        .select('name, my_attributes(name, label)')
         .eq('supplier_id', supplier.id)
         .not('my_attribute_id', 'is', null);
 
@@ -198,6 +198,7 @@ async function runSupplierSync(supabase, supplier) {
           const product = normalisedFull[i];
           if (!product) continue;
           let touched = false;
+          const summaryParts = [];
           for (const m of attrMappings) {
             const canonicalName = m.my_attributes?.name;
             if (!canonicalName) continue;
@@ -205,12 +206,27 @@ async function runSupplierSync(supabase, supplier) {
             if (rawVal === undefined || rawVal === null || rawVal === '') continue;
             product.specs = product.specs || {};
             product.specs[canonicalName] = rawVal;
+            summaryParts.push(`${m.my_attributes.label || canonicalName}: ${rawVal}`);
             touched = true;
+          }
+          // Include a supplier's own native fields too, if present, so the
+          // Odoo specs summary isn't limited to only explicitly-mapped
+          // attributes — e.g. TD Baltic already sends a real `warranty`
+          // field on every product without needing any mapping at all.
+          if (product.warranty) summaryParts.push(`Warranty: ${product.warranty}`);
+          if (summaryParts.length > 0) {
+            product.specs_summary = summaryParts.join(' | ');
           }
           if (touched) appliedCount++;
         }
         if (appliedCount > 0) {
           console.log(`[SYNC] ${supplier.name} — applied My Attributes mapping to ${appliedCount} product(s)`);
+        }
+      } else {
+        // Even with no mapped attributes, still surface native fields
+        // like TD Baltic's warranty into the Odoo specs summary.
+        for (const product of normalisedFull) {
+          if (product?.warranty) product.specs_summary = `Warranty: ${product.warranty}`;
         }
       }
     } catch (e) {
@@ -686,6 +702,22 @@ async function runSupplierSync(supabase, supplier) {
     if (odooConfig?.url && toExport.length) {
       console.log(`[ODOO] ${supplier.name} — pushing ${toExport.length} products (${ODOO_CHUNK}/batch, concurrency=${ODOO_CONCURRENCY})`);
 
+      // Ensure this supplier has a real Odoo vendor (res.partner) linked,
+      // using Odoo's native Vendor/Seller system rather than a plain text
+      // label — this shows up in each product's Purchase tab and lets
+      // Odoo's own vendor-pricing features work. Looked up/created once
+      // and cached on the supplier row; never repeated on later syncs.
+      if (!supplier.odoo_partner_id) {
+        try {
+          const partnerId = await odooClient.getOrCreateVendorPartner(odooConfig, supplier.name);
+          await supabase.from('suppliers').update({ odoo_partner_id: partnerId }).eq('id', supplier.id);
+          supplier.odoo_partner_id = partnerId;
+          console.log(`[ODOO] ${supplier.name} — linked to Odoo vendor partner #${partnerId}`);
+        } catch (e) {
+          console.warn(`[ODOO] Could not get/create vendor partner for ${supplier.name}: ${e.message}`);
+        }
+      }
+
       const batches = [];
       for (let i = 0; i < toExport.length; i += ODOO_CHUNK) {
         batches.push(toExport.slice(i, i + ODOO_CHUNK));
@@ -706,10 +738,25 @@ async function runSupplierSync(supabase, supplier) {
             )
           )
         );
-        for (const r of results) {
+        for (let ri = 0; ri < results.length; ri++) {
+          const r = results[ri];
           if (r.status === 'rejected') {
             odooBatchErrors++;
             console.error(`[ODOO] Batch permanently failed after retries:`, r.reason?.message);
+            continue;
+          }
+          // Push vendor pricing (product.supplierinfo) for whatever this
+          // batch just created/updated — uses the sku->odoo_id map
+          // returned by upsertBatch to know each product's real Odoo id.
+          if (supplier.odoo_partner_id && r.value?.skuToOdooId) {
+            const batch = window[ri];
+            const items = batch
+              .map(p => ({ odoo_id: r.value.skuToOdooId[p.sku], cost_price: p.cost_price, sku: p.sku }))
+              .filter(it => it.odoo_id);
+            if (items.length) {
+              await odooClient.syncVendorPricing(odooConfig, supplier.odoo_partner_id, items)
+                .catch(e => console.warn(`[ODOO] Vendor pricing update failed for a batch: ${e.message}`));
+            }
           }
         }
       }
