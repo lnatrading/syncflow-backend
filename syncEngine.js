@@ -394,17 +394,33 @@ async function runSupplierSync(supabase, supplier) {
         }
         const { data: existingCats } = await supabase.from('supplier_categories')
           .select('id, path').eq('supplier_id', supplier.id);
-        if (existingCats) {
-          let updated = 0;
-          const BATCH = 50;
-          for (let i = 0; i < existingCats.length; i += BATCH) {
-            const batch = existingCats.slice(i, i + BATCH);
-            await Promise.all(batch.map(cat => {
-              const count = catCounts[cat.path] || 0;
-              if (count > 0) updated++;
-              return supabase.from('supplier_categories')
-                .update({ product_count: count }).eq('id', cat.id);
-            }));
+        if (existingCats && existingCats.length > 0) {
+          // Single chunked bulk upsert instead of one UPDATE per category —
+          // for a supplier with hundreds of categories (e.g. DCS's 929),
+          // the old per-row loop meant hundreds of individual statements
+          // added on top of the main product upsert in the same sync,
+          // competing for the same DB connection and contributing to
+          // statement-timeout errors. Same chunk+retry pattern already
+          // proven reliable for the products table upsert.
+          const updateRows = existingCats.map(cat => ({
+            id: cat.id,
+            product_count: catCounts[cat.path] || 0,
+          }));
+          let updated = updateRows.filter(r => r.product_count > 0).length;
+
+          const CAT_CHUNK = 300;
+          for (let i = 0; i < updateRows.length; i += CAT_CHUNK) {
+            const chunk = updateRows.slice(i, i + CAT_CHUNK);
+            await withRetry(async () => {
+              const { error } = await supabase.from('supplier_categories')
+                .upsert(chunk, { onConflict: 'id' });
+              if (error) throw new Error(error.message);
+            }, {
+              maxAttempts: 3,
+              baseDelayMs: 2000,
+              multiplier:  2,
+              label: `${supplier.name} category count chunk @${i}`,
+            }).catch(e => console.warn(`[SYNC] Category count chunk @${i} failed after retries:`, e.message));
           }
           console.log(`[SYNC] Category counts updated: ${updated}/${existingCats.length} with product counts`);
         }
@@ -623,9 +639,9 @@ async function runSupplierSync(supabase, supplier) {
             throw err;
           }
         }, {
-          maxAttempts: 3,
-          baseDelayMs: 2000,
-          multiplier:  2,     // 2s → 4s
+          maxAttempts: 4,
+          baseDelayMs: 3000,
+          multiplier:  3,     // 3s → 9s → 27s
           label:       `${supplier.name} upsert chunk @${i}`,
         });
       } catch (err) {
