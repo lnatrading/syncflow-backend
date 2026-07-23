@@ -80,7 +80,20 @@ function xmlrpcCall(config, clientType, method, params) {
 // errors with no indication of which field or product caused it.
 function sanitizeXmlText(str) {
   if (str == null) return str;
-  return String(str).replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '');
+  let s = String(str);
+  // Strip ASCII control characters — illegal in XML 1.0.
+  s = s.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '');
+  // Strip LONE (unpaired) UTF-16 surrogates — invisible in normal text
+  // display, but invalid in well-formed UTF-8/XML output. These can end
+  // up in a JS string when source text had corrupted or mismatched
+  // encoding — plausible for a large, messy international feed like
+  // DCS's 180k+ row CSV. A valid surrogate pair (high followed by low,
+  // e.g. an emoji) is left completely untouched; only an unpaired one
+  // is removed. The capture group + $1 replacement is required to avoid
+  // accidentally deleting the valid character preceding a lone low
+  // surrogate — verified against test cases before shipping.
+  s = s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|([^\uD800-\uDBFF]|^)[\uDC00-\uDFFF]/g, '$1');
+  return s;
 }
 
 // Guards against NaN/Infinity, which are also invalid in XML-RPC.
@@ -185,6 +198,7 @@ async function upsertBatch(config, products) {
     const values = {
       name:             sanitizeXmlText(product.name),
       default_code:     sanitizeXmlText(product.sku),
+      barcode:          sanitizeXmlText(product.ean) || false,
       list_price:       safeNumber(product.sale_price, 0),
       standard_price:   safeNumber(product.cost_price, 0),
       description_sale: sanitizeXmlText(product.description) || '',
