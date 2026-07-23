@@ -21,14 +21,50 @@ function getClients(odooUrl) {
   };
 }
 
-// ── Promisify xmlrpc call ──────────────────────────────────
+// ── Promisify xmlrpc call, with a hard timeout ─────────────
+// CRITICAL: the xmlrpc library's methodCall() has no built-in timeout —
+// it relies entirely on the underlying TCP connection. If Odoo hangs,
+// becomes unresponsive, or a connection silently stalls (common with
+// self-hosted instances under load), the callback simply never fires
+// and this Promise would hang FOREVER with no timeout. Since every
+// supplier's sync eventually calls into Odoo, this single hang point
+// was capable of freezing all suppliers simultaneously and indefinitely
+// — the is_syncing lock never gets released because .catch()/.finally()
+// in server.js/syncEngine.js only run once the Promise actually settles,
+// which it never did. Racing against a timer guarantees this always
+// settles within RPC_TIMEOUT_MS, so a hung Odoo connection becomes a
+// clear, recoverable error instead of a silent, permanent freeze.
+const RPC_TIMEOUT_MS = 45000;
+
 function call(client, method, params) {
-  return new Promise((resolve, reject) => {
-    client.methodCall(method, params, (err, val) => {
-      if (err) reject(err);
-      else resolve(val);
-    });
-  });
+  return Promise.race([
+    new Promise((resolve, reject) => {
+      client.methodCall(method, params, (err, val) => {
+        if (err) reject(err);
+        else resolve(val);
+      });
+    }),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`Odoo XML-RPC call '${method}' timed out after ${RPC_TIMEOUT_MS / 1000}s — Odoo may be unresponsive or unreachable`)), RPC_TIMEOUT_MS)
+    ),
+  ]);
+}
+
+// SEPARATE PRE-EXISTING BUG, also fixed here: 'xmlrpcCall' is referenced in
+// ~15 places throughout this file (updateOrderTracking, createPurchaseOrder,
+// createVendorBill, createInboundReceipt, etc.) and is even imported by
+// odooCompat.js — but was never actually defined or exported anywhere.
+// Every function using it would throw "ReferenceError: xmlrpcCall is not
+// defined" the instant it ran. This wrapper matches the exact signature
+// those call sites already use — (config, clientType, method, params) —
+// resolving the right XML-RPC client from config.url and delegating to
+// the timeout-protected call() above, so those call sites also gain the
+// same hang-proof timeout protection.
+function xmlrpcCall(config, clientType, method, params) {
+  const clients = getClients(config.url);
+  const client  = clients[clientType];
+  if (!client) throw new Error(`xmlrpcCall: unknown client type '${clientType}' (expected 'object' or 'common')`);
+  return call(client, method, params);
 }
 
 // ── Test connection ────────────────────────────────────────
@@ -173,13 +209,22 @@ async function upsertBatch(config, products) {
   }
 
   // ── Step 3: Update existing products ────────────────────────────────────
-  // write() per product — creates are already batched so total calls = batch size.
-  for (const { odoo_id, values } of toUpdate) {
-    await call(object, 'execute_kw', [
-      config.database, uid, config.api_key,
-      'product.template', 'write',
-      [[odoo_id], values]
-    ]).catch(e => console.error(`[ODOO] write failed for id ${odoo_id}:`, e.message));
+  // Previously one write() call per product, fully sequential — fine for a
+  // few thousand products, but for a large catalogue that's almost entirely
+  // updates (e.g. DCS's 177k+ products after the first sync), one XML-RPC
+  // round-trip at a time could take many HOURS wall-clock. Now runs with
+  // bounded concurrency instead — same total number of calls, but many in
+  // flight at once rather than waiting for each one before starting the next.
+  const WRITE_CONCURRENCY = 15;
+  for (let i = 0; i < toUpdate.length; i += WRITE_CONCURRENCY) {
+    const window = toUpdate.slice(i, i + WRITE_CONCURRENCY);
+    await Promise.all(window.map(({ odoo_id, values }) =>
+      call(object, 'execute_kw', [
+        config.database, uid, config.api_key,
+        'product.template', 'write',
+        [[odoo_id], values]
+      ]).catch(e => console.error(`[ODOO] write failed for id ${odoo_id}:`, e.message))
+    ));
   }
 
   return { created: toCreate.length, updated: toUpdate.length, skuToOdooId };
@@ -516,4 +561,4 @@ async function createInboundReceipt(config, { odoo_sale_ref, odoo_po_id, waybill
   }
 }
 
-module.exports = { testConnection, upsertBatch, authenticate, updateOrderTracking, updateInboundTracking, createPurchaseOrder, createVendorBill, createInboundReceipt, getOrCreateVendorPartner, syncVendorPricing };
+module.exports = { testConnection, upsertBatch, authenticate, updateOrderTracking, updateInboundTracking, createPurchaseOrder, createVendorBill, createInboundReceipt, getOrCreateVendorPartner, syncVendorPricing, xmlrpcCall };
