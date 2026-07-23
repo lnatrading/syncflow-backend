@@ -287,6 +287,7 @@ async function syncVendorPricing(config, partnerId, items) {
 
   let created = 0, updated = 0;
   const toCreate = [];
+  const toWrite  = []; // { supplierinfoId, price }
 
   for (const item of items) {
     if (!item.odoo_id) continue;
@@ -294,15 +295,28 @@ async function syncVendorPricing(config, partnerId, items) {
     const supplierinfoId = existingByTemplateId[item.odoo_id];
 
     if (supplierinfoId) {
-      await call(object, 'execute_kw', [
-        config.database, uid, config.api_key,
-        'product.supplierinfo', 'write',
-        [[supplierinfoId], { price }]
-      ]).catch(e => console.error(`[ODOO] supplierinfo write failed for template ${item.odoo_id}:`, e.message));
-      updated++;
+      toWrite.push({ supplierinfoId, price });
     } else {
       toCreate.push({ partner_id: partnerId, product_tmpl_id: item.odoo_id, price, min_qty: 1 });
     }
+  }
+
+  // Bounded concurrency instead of one write() at a time — same fix
+  // already applied to the main product update loop, needed here too
+  // since most products already have a vendor-price record after the
+  // first sync, meaning nearly the whole batch went through this loop
+  // sequentially every single time.
+  const WRITE_CONCURRENCY = 15;
+  for (let i = 0; i < toWrite.length; i += WRITE_CONCURRENCY) {
+    const window = toWrite.slice(i, i + WRITE_CONCURRENCY);
+    await Promise.all(window.map(({ supplierinfoId, price }) =>
+      call(object, 'execute_kw', [
+        config.database, uid, config.api_key,
+        'product.supplierinfo', 'write',
+        [[supplierinfoId], { price }]
+      ]).catch(e => console.error(`[ODOO] supplierinfo write failed for template:`, e.message))
+    ));
+    updated += window.length;
   }
 
   if (toCreate.length) {
