@@ -393,7 +393,7 @@ async function runSupplierSync(supabase, supplier) {
           catCounts[path] = (catCounts[path] || 0) + 1;
         }
         const { data: existingCats } = await supabase.from('supplier_categories')
-          .select('id, path').eq('supplier_id', supplier.id);
+          .select('id, path, name').eq('supplier_id', supplier.id);
         if (existingCats && existingCats.length > 0) {
           // Single chunked bulk upsert instead of one UPDATE per category —
           // for a supplier with hundreds of categories (e.g. DCS's 929),
@@ -402,8 +402,18 @@ async function runSupplierSync(supabase, supplier) {
           // competing for the same DB connection and contributing to
           // statement-timeout errors. Same chunk+retry pattern already
           // proven reliable for the products table upsert.
+          //
+          // IMPORTANT: supplier_id/path/name must be included even though
+          // they're unchanged — Postgres validates NOT NULL columns during
+          // the INSERT phase of INSERT...ON CONFLICT DO UPDATE regardless
+          // of whether it resolves as an update. Sending only {id,
+          // product_count} triggered "null value in column supplier_id
+          // violates not-null constraint" on every single chunk.
           const updateRows = existingCats.map(cat => ({
             id: cat.id,
+            supplier_id: supplier.id,
+            path: cat.path,
+            name: cat.name,
             product_count: catCounts[cat.path] || 0,
           }));
           let updated = updateRows.filter(r => r.product_count > 0).length;
@@ -1403,7 +1413,9 @@ function mergeEndpointData(products, secondaryData, role) {
   // the first row is used as the primary match, the rest are kept as alts.
   const byId = {};
   for (const item of secondaryData) {
-    const key = item.sku_parent || item.TDPartNbr || item['@_TDPartNbr'] || item.SKU || item.sku || item.ref || item.code || item.id || item.productId;
+    const key = item.sku_parent || item.TDPartNbr || item['@_TDPartNbr'] || item.SKU || item.sku
+              || item['Product number'] || item['EAN number']  // DCS raw column names
+              || item.ref || item.code || item.id || item.productId;
     if (key == null) continue;
     const k = String(key);
     if (!byId[k]) byId[k] = [];
@@ -1411,7 +1423,9 @@ function mergeEndpointData(products, secondaryData, role) {
   }
 
   return products.map(p => {
-    const key = p.TDPartNbr || p.SKU || p.sku || p.ref || p.code || p.id;
+    const key = p.TDPartNbr || p.SKU || p.sku
+              || p['Product number'] || p['EAN number']  // DCS raw column names
+              || p.ref || p.code || p.id;
     const rows = key != null ? byId[String(key)] : null;
     if (!rows || !rows.length) return p;
 
@@ -2034,6 +2048,28 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
   if (qty2 !== undefined) {
     product.specs = product.specs || {};
     product.specs.qty2_forecast = parseInt(qty2, 10) || 0;
+  }
+
+  // Apply the fast-update feed's own price/qty as an OVERRIDE, not just a
+  // fallback — this is the entire reason a separate fast-update endpoint
+  // exists (fresher stock/price than the slower full-catalogue feed).
+  // Previously only qty2/ean were ever read back out of the merged
+  // _otherData/_fast_updateData object; the feed's own price/qty sat
+  // there unused every sync, meaning a fast feed running every 30 minutes
+  // had zero actual effect on the stock/price a product ultimately synced
+  // with — it always came from whichever endpoint last did a full parse.
+  // Independent of the qty2 block above — a product can have fast-feed
+  // price/qty without qty2 being present, or vice versa.
+  const fastFeed = raw._otherData || raw._fast_updateData;
+  if (fastFeed) {
+    const fastQty   = fastFeed.qty ?? fastFeed.quantity ?? fastFeed.Inventory ?? fastFeed.stock;
+    const fastPrice = fastFeed.price ?? fastFeed.Price ?? fastFeed.cost;
+    if (fastQty !== undefined && fastQty !== null && fastQty !== '') {
+      product.stock_qty = parseInt(fastQty, 10) || 0;
+    }
+    if (fastPrice !== undefined && fastPrice !== null && fastPrice !== '') {
+      product.cost_price = parseFloat(fastPrice) || product.cost_price;
+    }
   }
 
   // Mediamax deeplink + stock-status flag (Feed de actualización lenta)
