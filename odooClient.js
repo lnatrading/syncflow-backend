@@ -67,6 +67,28 @@ function xmlrpcCall(config, clientType, method, params) {
   return call(client, method, params);
 }
 
+// ── SANITIZE TEXT FOR XML-RPC ──────────────────────────────────
+// XML 1.0 only allows a specific character range — most control
+// characters (0x00-0x08, 0x0B, 0x0C, 0x0E-0x1F) are simply illegal in
+// an XML document and will break the ENTIRE request if present
+// anywhere in the payload, not just the field that contains them.
+// Supplier feeds (especially messier ones) occasionally carry stray
+// control characters or corrupted encoding in free-text fields like
+// name/description — this strips anything outside the valid XML
+// range before it ever reaches the XML-RPC layer, rather than
+// discovering it product-by-product via "Invalid XML-RPC message"
+// errors with no indication of which field or product caused it.
+function sanitizeXmlText(str) {
+  if (str == null) return str;
+  return String(str).replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '');
+}
+
+// Guards against NaN/Infinity, which are also invalid in XML-RPC.
+function safeNumber(n, fallback = 0) {
+  const v = Number(n);
+  return Number.isFinite(v) ? v : fallback;
+}
+
 // ── Test connection ────────────────────────────────────────
 async function testConnection(config) {
   const { common } = getClients(config.url);
@@ -161,18 +183,18 @@ async function upsertBatch(config, products) {
 
   for (const product of products) {
     const values = {
-      name:             product.name,
-      default_code:     product.sku,
-      list_price:       product.sale_price  || 0,
-      standard_price:   product.cost_price  || 0,
-      description_sale: product.description || '',
+      name:             sanitizeXmlText(product.name),
+      default_code:     sanitizeXmlText(product.sku),
+      list_price:       safeNumber(product.sale_price, 0),
+      standard_price:   safeNumber(product.cost_price, 0),
+      description_sale: sanitizeXmlText(product.description) || '',
       ...typeFields,
       // Supplier availability (cross-dock model) — NOT physical on-hand stock.
       // Requires custom Integer field x_supplier_qty on product.template in Odoo.
-      ...(product.stock_qty != null ? { x_supplier_qty: product.stock_qty } : {}),
+      ...(product.stock_qty != null ? { x_supplier_qty: safeNumber(product.stock_qty, 0) } : {}),
       // Image stored as URL, not Base64 binary — prevents database bloat.
       // Requires custom Char field x_image_url on product.template in Odoo.
-      ...(product.image_url ? { x_image_url: product.image_url } : {}),
+      ...(product.image_url ? { x_image_url: sanitizeXmlText(product.image_url) } : {}),
       // Human-readable spec summary built from mapped My Attributes (e.g.
       // "Product Type: Smartphone | Condition: New | Warranty: 24 months").
       // ONE generic field for ALL mapped attributes, deliberately — a
@@ -181,7 +203,7 @@ async function upsertBatch(config, products) {
       // into Odoo Studio. This field just grows richer automatically as
       // more attributes get mapped, no Odoo-side changes ever needed again.
       // Requires custom Text field x_specifications on product.template in Odoo.
-      ...(product.specs_summary ? { x_specifications: product.specs_summary } : {}),
+      ...(product.specs_summary ? { x_specifications: sanitizeXmlText(product.specs_summary) } : {}),
     };
 
     if (existingBySku[product.sku]) {
@@ -291,7 +313,7 @@ async function syncVendorPricing(config, partnerId, items) {
 
   for (const item of items) {
     if (!item.odoo_id) continue;
-    const price = item.cost_price || 0;
+    const price = safeNumber(item.cost_price, 0);
     const supplierinfoId = existingByTemplateId[item.odoo_id];
 
     if (supplierinfoId) {
