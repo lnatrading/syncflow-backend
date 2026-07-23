@@ -21,7 +21,7 @@ const ODOO_CHUNK     = 100;
 const ODOO_CONCURRENCY = 5;
 
 // ── MAIN ENTRY POINT ────────────────────────────────────────
-async function runSupplierSync(supabase, supplier) {
+async function runSupplierSyncInner(supabase, supplier) {
   const jobStart = new Date();
 
   const { data: job } = await supabase.from('sync_jobs').insert({
@@ -2218,6 +2218,32 @@ async function discoverCategories(supabase, supplierId, rawCategories) {
 
   await supabase.from('supplier_categories')
     .upsert(rows, { onConflict: 'supplier_id,path', ignoreDuplicates: true });
+}
+
+// ── WATCHDOG WRAPPER ──────────────────────────────────────────
+// Guarantees a sync ALWAYS settles (resolves or rejects) within a hard
+// ceiling, no matter what hangs inside it — even a hang point we
+// haven't found yet. Without this, a single unprotected await anywhere
+// in the sync (a network call, a Supabase query, anything) could freeze
+// a supplier's is_syncing lock forever, since the callers' .catch()/
+// .finally() (in server.js's cron handler and routes/suppliers.js's
+// manual sync route) only run once the returned Promise actually
+// settles. We've already found and fixed three separate unprotected
+// hang points this session (Odoo RPC calls with no timeout, two
+// sequential per-product write loops) — this is a backstop against
+// the next one we haven't discovered yet, not a replacement for
+// fixing root causes when we find them.
+const SYNC_WATCHDOG_MS = 3 * 60 * 60 * 1000; // 3 hours
+
+async function runSupplierSync(supabase, supplier) {
+  return Promise.race([
+    runSupplierSyncInner(supabase, supplier),
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(
+        `Sync for ${supplier.name} exceeded the ${SYNC_WATCHDOG_MS / 3600000}h watchdog limit and was aborted — is_syncing lock will still be released normally.`
+      )), SYNC_WATCHDOG_MS)
+    ),
+  ]);
 }
 
 module.exports = { runSupplierSync };
