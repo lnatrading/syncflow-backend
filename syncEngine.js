@@ -785,6 +785,13 @@ async function runSupplierSync(supabase, supplier) {
             }
           }
         }
+        // Progress log — previously this whole phase was completely silent
+        // between the initial "pushing X products" line and the final
+        // "[SYNC] Done" line, which could be minutes or hours for a large
+        // supplier. No way to tell "still working" from "actually stuck"
+        // during that window. Now logs after every concurrency window.
+        const donePct = Math.min(100, Math.round(((i + window.length) / batches.length) * 100));
+        console.log(`[ODOO] ${supplier.name} — progress: ${Math.min(i + window.length, batches.length)}/${batches.length} batches (${donePct}%), ${odooBatchErrors} batch error(s) so far`);
       }
 
       if (odooBatchErrors > 0) {
