@@ -168,16 +168,31 @@ async function upsertBatch(config, products) {
   const uid = await authenticate(config);
   const { object } = getClients(config.url);
 
-  // ── Step 1: Find which SKUs already exist (1 query for the whole batch) ──
+  // ── Step 1: Find which products already exist — by SKU AND by barcode ────
+  // Matching only by SKU (default_code) misses products that already exist
+  // in Odoo from a DIFFERENT source under a different SKU but the SAME
+  // real-world EAN/barcode — e.g. a product already imported via the
+  // ITscope Catalog module. Odoo enforces barcode uniqueness, so trying to
+  // create/update a "new" product with a barcode that's already claimed
+  // fails outright ("Barcode(s) already assigned"). Searching by both in
+  // one combined query lets a barcode match serve as a fallback: if we
+  // don't recognise the SKU but the EAN already exists, we update that
+  // existing record instead of colliding with it.
   const skus = products.map(p => p.sku).filter(Boolean);
+  const eans = products.map(p => p.ean).filter(Boolean);
+  const domain = eans.length
+    ? ['|', ['default_code', 'in', skus], ['barcode', 'in', eans]]
+    : [['default_code', 'in', skus]];
+
   const existing = await call(object, 'execute_kw', [
     config.database, uid, config.api_key,
     'product.template', 'search_read',
-    [[['default_code', 'in', skus]]],
-    { fields: ['id', 'default_code'], limit: skus.length }
+    [domain],
+    { fields: ['id', 'default_code', 'barcode'], limit: skus.length + eans.length }
   ]);
 
-  const existingBySku = Object.fromEntries(existing.map(r => [r.default_code, r.id]));
+  const existingBySku     = Object.fromEntries(existing.filter(r => r.default_code).map(r => [r.default_code, r.id]));
+  const existingByBarcode = Object.fromEntries(existing.filter(r => r.barcode).map(r => [r.barcode, r.id]));
 
   const toCreate = [];
   const toUpdate = []; // [{ odoo_id, values }]
@@ -203,6 +218,11 @@ async function upsertBatch(config, products) {
       standard_price:   safeNumber(product.cost_price, 0),
       description_sale: sanitizeXmlText(product.description) || '',
       ...typeFields,
+      // Native Odoo product category (product.category, hierarchical) —
+      // resolved once per unique "My Category" path via
+      // getOrCreateCategoryHierarchy() and attached to each product as
+      // odoo_category_id before this function is called.
+      ...(product.odoo_category_id ? { categ_id: product.odoo_category_id } : {}),
       // Supplier availability (cross-dock model) — NOT physical on-hand stock.
       // Requires custom Integer field x_supplier_qty on product.template in Odoo.
       ...(product.stock_qty != null ? { x_supplier_qty: safeNumber(product.stock_qty, 0) } : {}),
@@ -220,8 +240,24 @@ async function upsertBatch(config, products) {
       ...(product.specs_summary ? { x_specifications: sanitizeXmlText(product.specs_summary) } : {}),
     };
 
-    if (existingBySku[product.sku]) {
-      toUpdate.push({ odoo_id: existingBySku[product.sku], values });
+    // Prefer an exact SKU match (this is definitely "our" product from a
+    // prior sync). Fall back to a barcode match only if the SKU is
+    // unrecognised — that means a different source (e.g. ITscope) already
+    // created this exact real-world product under its own SKU.
+    const skuMatchId     = existingBySku[product.sku];
+    const barcodeMatchId = product.ean ? existingByBarcode[product.ean] : null;
+    const matchedId      = skuMatchId || barcodeMatchId;
+    const matchedViaBarcodeOnly = !skuMatchId && !!barcodeMatchId;
+
+    if (matchedViaBarcodeOnly) {
+      // Don't touch default_code here — overwriting the other system's own
+      // SKU/reference on their product could break their ability to find
+      // and re-sync it later. We still update price/stock/description/etc.
+      delete values.default_code;
+    }
+
+    if (matchedId) {
+      toUpdate.push({ odoo_id: matchedId, values, sku: product.sku });
     } else {
       toCreate.push(values);
     }
@@ -229,8 +265,8 @@ async function upsertBatch(config, products) {
 
   // ── Step 2: Create all new products in one call ──────────────────────────
   const skuToOdooId = {};
-  for (const { odoo_id, values } of toUpdate) {
-    skuToOdooId[values.default_code] = odoo_id;
+  for (const { odoo_id, sku } of toUpdate) {
+    skuToOdooId[sku] = odoo_id;
   }
 
   if (toCreate.length) {
@@ -365,6 +401,210 @@ async function syncVendorPricing(config, partnerId, items) {
   }
 
   return { created, updated };
+}
+
+// ── VIRTUAL INVENTORY (opt-in, per supplier) ───────────────────
+// Writes REAL stock.quant records at a dedicated internal location, so
+// Odoo's own qty_available / website "in stock" logic treats supplier
+// stock as genuine available inventory — not just an informational
+// custom field like x_supplier_qty. This is a bigger commitment than
+// x_supplier_qty: it touches Odoo's actual inventory core (stock
+// valuation, moves, availability checks across sales/website/POS).
+//
+// The location MUST be usage:'internal' for qty_available to count it
+// at all — Odoo only sums internal-type locations. Naming it clearly
+// ("Virtual Dropship Stock") keeps it visually distinct from a real
+// physical warehouse when anyone inspects stock moves, even though
+// technically Odoo treats it as an ordinary internal location.
+//
+// For an EXISTING quant, we use inventory_quantity + action_apply_inventory
+// (the same mechanism Odoo's own manual "Update Quantity" UI uses) rather
+// than writing quantity directly — this generates a proper stock.move
+// and preserves stock valuation/audit history. For a brand-new quant
+// (no prior record), Odoo lets you set quantity directly on create() —
+// the standard pattern used for initial/bulk stock seeding.
+
+async function getOrCreateVirtualLocation(config, locationName = 'Virtual Dropship Stock') {
+  const uid = await authenticate(config);
+  const { object } = getClients(config.url);
+
+  const existing = await call(object, 'execute_kw', [
+    config.database, uid, config.api_key,
+    'stock.location', 'search_read',
+    [[['name', '=', locationName], ['usage', '=', 'internal']]],
+    { fields: ['id'], limit: 1 }
+  ]);
+  if (existing.length) return existing[0].id;
+
+  // Nest it under the default warehouse's view location, same as any
+  // other internal location, so it shows up naturally in Odoo's
+  // location hierarchy rather than floating unattached.
+  let parentId = null;
+  const warehouses = await call(object, 'execute_kw', [
+    config.database, uid, config.api_key,
+    'stock.warehouse', 'search_read', [[]],
+    { fields: ['id', 'view_location_id'], limit: 1 }
+  ]);
+  if (warehouses.length) parentId = warehouses[0].view_location_id[0];
+
+  const [newId] = await call(object, 'execute_kw', [
+    config.database, uid, config.api_key,
+    'stock.location', 'create',
+    [[{ name: locationName, usage: 'internal', location_id: parentId }]]
+  ]);
+  console.log(`[ODOO] Created virtual inventory location #${newId} ("${locationName}")`);
+  return newId;
+}
+
+// items: [{ odoo_id (product.template id), stock_qty, sku }]
+async function syncVirtualStock(config, locationId, items) {
+  if (!locationId || !items.length) return { created: 0, updated: 0 };
+  const uid = await authenticate(config);
+  const { object } = getClients(config.url);
+
+  const templateIds = items.map(i => i.odoo_id).filter(Boolean);
+  if (!templateIds.length) return { created: 0, updated: 0 };
+
+  // stock.quant.product_id refers to product.product (the VARIANT), not
+  // product.template — resolve variant ids in one batched search, not
+  // per-product. For simple/non-variant products (the norm here), each
+  // template has exactly one variant.
+  const variants = await call(object, 'execute_kw', [
+    config.database, uid, config.api_key,
+    'product.product', 'search_read',
+    [[['product_tmpl_id', 'in', templateIds]]],
+    { fields: ['id', 'product_tmpl_id'] }
+  ]);
+  const variantIdByTemplateId = {};
+  for (const v of variants) {
+    const tmplId = Array.isArray(v.product_tmpl_id) ? v.product_tmpl_id[0] : v.product_tmpl_id;
+    variantIdByTemplateId[tmplId] = v.id;
+  }
+
+  const variantIds = Object.values(variantIdByTemplateId);
+  const existingQuants = await call(object, 'execute_kw', [
+    config.database, uid, config.api_key,
+    'stock.quant', 'search_read',
+    [[['location_id', '=', locationId], ['product_id', 'in', variantIds]]],
+    { fields: ['id', 'product_id'] }
+  ]);
+  const quantIdByVariantId = {};
+  for (const q of existingQuants) {
+    const vId = Array.isArray(q.product_id) ? q.product_id[0] : q.product_id;
+    quantIdByVariantId[vId] = q.id;
+  }
+
+  let created = 0, updated = 0;
+  const toCreate = [];
+  const toAdjust = []; // { quantId, qty }
+
+  for (const item of items) {
+    const variantId = variantIdByTemplateId[item.odoo_id];
+    if (!variantId) continue;
+    const qty = safeNumber(item.stock_qty, 0);
+    const quantId = quantIdByVariantId[variantId];
+
+    if (quantId) {
+      toAdjust.push({ quantId, qty });
+    } else {
+      toCreate.push({ product_id: variantId, location_id: locationId, quantity: qty });
+    }
+  }
+
+  // Existing quants: set inventory_quantity then apply — bounded
+  // concurrency, same pattern as the vendor-pricing/product-write fixes.
+  const WRITE_CONCURRENCY = 15;
+  for (let i = 0; i < toAdjust.length; i += WRITE_CONCURRENCY) {
+    const window = toAdjust.slice(i, i + WRITE_CONCURRENCY);
+    await Promise.all(window.map(async ({ quantId, qty }) => {
+      try {
+        await call(object, 'execute_kw', [
+          config.database, uid, config.api_key,
+          'stock.quant', 'write',
+          [[quantId], { inventory_quantity: qty }]
+        ]);
+        await call(object, 'execute_kw', [
+          config.database, uid, config.api_key,
+          'stock.quant', 'action_apply_inventory',
+          [[quantId]]
+        ]);
+      } catch (e) {
+        console.error(`[ODOO] virtual stock adjust failed for quant ${quantId}:`, e.message);
+      }
+    }));
+    updated += window.length;
+  }
+
+  // New quants: quantity can be set directly on create — the standard
+  // pattern for initial/bulk stock seeding.
+  if (toCreate.length) {
+    await call(object, 'execute_kw', [
+      config.database, uid, config.api_key,
+      'stock.quant', 'create',
+      [toCreate]
+    ]).catch(e => console.error('[ODOO] virtual stock create failed:', e.message));
+    created = toCreate.length;
+  }
+
+  return { created, updated };
+}
+
+// ── PRODUCT CATEGORIES (Odoo native product.category, hierarchical) ──
+// Resolves our "Parent / Child" My Category paths into real Odoo
+// product.category records, matching Odoo's own hierarchy model
+// (parent_id). Takes a batch of paths at once and caches each segment
+// as it goes, so a shared parent (e.g. "Computing" under both
+// "Computing / Laptops" and "Computing / Servers") only gets
+// searched/created once per call, not once per path.
+// Returns a Map of the original full path string -> leaf category id.
+async function getOrCreateCategoryHierarchy(config, categoryPaths) {
+  const uid = await authenticate(config);
+  const { object } = getClients(config.url);
+
+  const segmentCache = new Map(); // "segment path so far" -> odoo category id
+  const result = new Map();       // original full path -> leaf id
+
+  for (const path of categoryPaths) {
+    if (!path) continue;
+    const segments = path.split('/').map(s => s.trim()).filter(Boolean);
+    let parentId = false;
+    let pathSoFar = '';
+
+    for (const segment of segments) {
+      pathSoFar = pathSoFar ? `${pathSoFar} / ${segment}` : segment;
+
+      if (segmentCache.has(pathSoFar)) {
+        parentId = segmentCache.get(pathSoFar);
+        continue;
+      }
+
+      const domain = parentId
+        ? [['name', '=', segment], ['parent_id', '=', parentId]]
+        : [['name', '=', segment], ['parent_id', '=', false]];
+
+      const existing = await call(object, 'execute_kw', [
+        config.database, uid, config.api_key,
+        'product.category', 'search_read',
+        [domain], { fields: ['id'], limit: 1 }
+      ]);
+
+      let id;
+      if (existing.length) {
+        id = existing[0].id;
+      } else {
+        [id] = await call(object, 'execute_kw', [
+          config.database, uid, config.api_key,
+          'product.category', 'create',
+          [[{ name: segment, parent_id: parentId }]]
+        ]);
+      }
+      segmentCache.set(pathSoFar, id);
+      parentId = id;
+    }
+    result.set(path, parentId);
+  }
+
+  return result;
 }
 
 // ── PUSH TRACKING NUMBER TO ODOO SALE ORDER ───────────────────
@@ -611,4 +851,4 @@ async function createInboundReceipt(config, { odoo_sale_ref, odoo_po_id, waybill
   }
 }
 
-module.exports = { testConnection, upsertBatch, authenticate, updateOrderTracking, updateInboundTracking, createPurchaseOrder, createVendorBill, createInboundReceipt, getOrCreateVendorPartner, syncVendorPricing, xmlrpcCall };
+module.exports = { testConnection, upsertBatch, authenticate, updateOrderTracking, updateInboundTracking, createPurchaseOrder, createVendorBill, createInboundReceipt, getOrCreateVendorPartner, syncVendorPricing, xmlrpcCall, getOrCreateVirtualLocation, syncVirtualStock, getOrCreateCategoryHierarchy };
