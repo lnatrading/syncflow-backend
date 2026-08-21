@@ -9,6 +9,7 @@ const BigBuyClient  = require('./orderClients/BigBuyClient');
 const MediamaxClient= require('./orderClients/MediamaxClient');
 const TDBalticClient= require('./orderClients/TDBaltcClient');
 const DCSClient     = require('./orderClients/DCSClient');
+const ABClient      = require('./orderClients/ABClient');
 const { withRetry } = require('./retry');
 
 // ── RETRY SCHEDULE ─────────────────────────────────────────────
@@ -31,6 +32,7 @@ const CLIENTS = [
   { match: ['mediamax'],        client: MediamaxClient },
   { match: ['tdbaltic','td baltic','td_baltic'], client: TDBalticClient },
   { match: ['dcs'],                             client: DCSClient      },
+  { match: ['ab.pl','ab s.a.','ab sa','abpl'],  client: ABClient       },
 ];
 
 function getClient(supplierName) {
@@ -245,7 +247,10 @@ async function placeSingleSupplierOrder(supabase, odooOrder, supplierId, bucket)
   // Longer-horizon retries (5 min, 15 min, 1 hr) are handled by retryFailedOrders().
   try {
     const placed = await withRetry(
-      () => client.placeOrder({ ...odooOrder, lines: bucket.lines }),
+      // _supabase is only consumed by ABClient (address-cache lookup —
+      // see safeguard #5 in orderClients/ABClient.js); harmless no-op
+      // extra field for every other client.
+      () => client.placeOrder({ ...odooOrder, lines: bucket.lines, _supabase: supabase }),
       {
         maxAttempts: 3,
         baseDelayMs: 5000,
