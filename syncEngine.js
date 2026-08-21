@@ -894,6 +894,22 @@ async function runSupplierSyncInner(supabase, supplier) {
     console.log(`[SYNC] Done: ${supplier.name} — ${created} created, ${updated} updated, ${errors} errors`);
 
   } catch (err) {
+    // Safeguard #7 (AB.pl error 1 — nightly data-replication window):
+    // an "expected" error is a known, routine condition, not a bug —
+    // log it quietly and let the next scheduled sync retry naturally,
+    // rather than raising a "Sync failed" alert on the dashboard.
+    if (err.expected) {
+      console.log(`[SYNC] ${supplier.name} — expected/routine skip: ${err.message}`);
+      // VERIFY: 'skipped' is a new status value not used elsewhere in
+      // Syncflow — confirm the frontend dashboard and any Supabase CHECK
+      // constraint on sync_jobs.status / suppliers.last_status accept it
+      // before relying on this; otherwise swap for whatever value your
+      // existing status vocabulary uses for "nothing to do this run".
+      await supabase.from('suppliers').update({ last_sync: new Date(), last_status: 'skipped' }).eq('id', supplier.id);
+      await supabase.from('sync_jobs').update({ status: 'skipped', error_message: err.message, finished_at: new Date() }).eq('id', jobId);
+      return;
+    }
+
     console.error(`[SYNC] Fatal error for ${supplier.name}:`, err.message);
     await supabase.from('suppliers').update({ last_sync: new Date(), last_status: 'error' }).eq('id', supplier.id);
     await supabase.from('sync_jobs').update({ status: 'error', error_message: err.message, finished_at: new Date() }).eq('id', jobId);
@@ -938,6 +954,19 @@ function buildAuth(supplier) {
       // auth_username, auth_password, plus any keys in auth_extra (e.g. orgnum).
       return {
         type:     'query_params',
+        username: supplier.auth_username,
+        password: supplier.auth_password,
+        extra:    supplier.auth_extra || {},
+      };
+
+    case 'post_body':
+      // Credentials sent as POST body params, not query string or headers —
+      // AB.pl pattern (client/login/pass on every POST to gateway.php).
+      // auth_username = AB login, auth_password = AB password,
+      // auth_extra.client = AB's zero-padded customer code (kept in
+      // auth_extra rather than a new column since it's AB-specific).
+      return {
+        type:     'post_body',
         username: supplier.auth_username,
         password: supplier.auth_password,
         extra:    supplier.auth_extra || {},
@@ -1201,6 +1230,120 @@ async function fetchEndpoint(urlTemplate, format, auth, templateValues = {}) {
     // 'api_key_url' and 'none' need no modification
   }
 
+  // ── AB.pl XML Gateway (POST, not GET) ────────────────────────
+  // AB's gateway.php takes req=<call>, client/login/pass, and returns
+  // XML. Unlike every other supplier's read endpoints, this is a POST
+  // with form-encoded params, not a GET — handled as its own branch
+  // rather than forcing fetchEndpoint's GET-only path to accommodate it.
+  //
+  // url_template for an AB endpoint should be just the base gateway URL
+  // with the req= value and any call-specific params appended as a
+  // normal query string, e.g.:
+  //   https://xml.ab.pl/gateway.php?req=products_all&mode=pricedata&withdesc=1
+  //   https://xml.ab.pl/gateway.php?req=groups
+  // fetchEndpoint parses req= and any other query params out of the
+  // template and re-sends them as POST body fields instead.
+  //
+  // ⚠ VERIFY: response XML shape (root element, whether products sit
+  // under <products><product> or similar) is assumed here from AB's
+  // field-list docs, not a live sample — see the "product array finder"
+  // below, which searches the parsed tree rather than assuming an exact
+  // path, precisely because that shape isn't confirmed yet. Confirm in
+  // Postman before trusting this in production (Ahmed's normal workflow
+  // for new parsers) and tighten the finder if it's ever ambiguous.
+  if (format === 'xml_post_abpl') {
+    const parsedUrl  = new URL(url);
+    const reqName    = parsedUrl.searchParams.get('req');
+    const extraQuery = {};
+    for (const [k, v] of parsedUrl.searchParams.entries()) {
+      if (k !== 'req') extraQuery[k] = v;
+    }
+
+    const bodyParams = new URLSearchParams();
+    bodyParams.set('req', reqName);
+    bodyParams.set('client', auth.extra?.client || '');
+    bodyParams.set('login',  auth.username || '');
+    bodyParams.set('pass',   auth.password || '');
+    // Safeguard #1: always send use_cache + cache_refresh together on
+    // read requests — AB's own docs recommend this to avoid error 8.
+    bodyParams.set('use_cache',     extraQuery.use_cache     ?? '1');
+    bodyParams.set('cache_refresh', extraQuery.cache_refresh ?? '1');
+    for (const [k, v] of Object.entries(extraQuery)) {
+      if (k === 'use_cache' || k === 'cache_refresh') continue;
+      bodyParams.set(k, v);
+    }
+
+    const response = await withRetry(
+      () => axios.post(`${parsedUrl.origin}${parsedUrl.pathname}`, bodyParams, {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': headers['User-Agent'] },
+        timeout: 90000,
+        responseType: 'text',
+      }),
+      {
+        maxAttempts: 3, baseDelayMs: 5000, multiplier: 3,
+        label: `AB.pl ${reqName}`,
+        onRetry: async (attempt, err) => {
+          const status = err?.response?.status;
+          if (status === 401 || status === 403) throw Object.assign(err, { noRetry: true });
+        },
+      }
+    );
+
+    const xmlParser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
+    let parsed;
+    try {
+      parsed = xmlParser.parse(response.data);
+    } catch (e) {
+      throw new Error(`AB.pl ${reqName}: failed to parse XML response — ${e.message} | Preview: ${String(response.data).slice(0, 200)}`);
+    }
+
+    // Error surface — see the same VERIFY note as ABClient.js's
+    // extractAbError(). Kept as a small local copy rather than importing
+    // from orderClients/ABClient.js to avoid coupling the sync path to
+    // the order-placement client module.
+    const errNode = findFirst(parsed, n => n && typeof n === 'object' &&
+      (n.error !== undefined || n.code !== undefined));
+    if (errNode) {
+      const rawCode = errNode.error ?? errNode.code;
+      const code = parseInt(typeof rawCode === 'object' ? rawCode['#text'] : rawCode, 10);
+      if (code) {
+        const err = new Error(`AB.pl ${reqName} error ${code}`);
+        // Safeguard #7: error 1 (nightly data-replication window) is a
+        // routine, expected condition — not a bug in our request and not
+        // worth an alert. The scheduler's normal per-endpoint retry on
+        // the next cron tick recovers it naturally.
+        if (code === 1) {
+          err.expected = true;
+          err.message = 'AB.pl temporarily unavailable (nightly data-replication window) — will retry on next scheduled sync';
+        }
+        throw err;
+      }
+    }
+
+    // Find the array of product/category records in the parsed tree
+    // rather than assuming an exact nesting path (see VERIFY note above).
+    const arr = findFirst(parsed, n => Array.isArray(n) && n.length > 0 &&
+      typeof n[0] === 'object' && ('id' in n[0] || 'abpn' in n[0] || 'parentid' in n[0]));
+    if (!arr) return [];
+
+    // req=products_all items carry `groups` (an array of category ids a
+    // product belongs to per the docs). mergeCategories() (called
+    // generically for any supplier with a role:'categories' endpoint —
+    // pair this with a req=groups endpoint) matches on a scalar
+    // categoryId field, so alias the first group id here. A product's
+    // full multi-category membership stays available on raw.groups for
+    // anything that wants it later (not currently used beyond this).
+    return arr.map(item => {
+      if (item.groups !== undefined && item.categoryId === undefined) {
+        const groupList = Array.isArray(item.groups) ? item.groups
+          : (item.groups?.item ?? item.groups); // VERIFY: array wrapper shape
+        const first = Array.isArray(groupList) ? groupList[0] : groupList;
+        if (first !== undefined) return { ...item, categoryId: first };
+      }
+      return item;
+    });
+  }
+
   // ── Mediamax paginated JSON catalogue ────────────────────────
   // GET /product/all?pag=N&max=50
   // Each page returns { code, data: [{ id, attributes:{...} }] }
@@ -1275,6 +1418,23 @@ async function fetchEndpoint(urlTemplate, format, auth, templateValues = {}) {
     }
   );
   return parseResponse(response.data, format);
+}
+
+// ── GENERIC TREE SEARCH ──────────────────────────────────────
+// Depth-first search through a parsed-XML object tree for the first
+// node matching `predicate`. Used by the AB.pl branch above to locate
+// error nodes / product arrays without assuming an exact nesting path
+// (the real shape isn't confirmed against a live response yet).
+function findFirst(node, predicate, depth = 0) {
+  if (depth > 6 || node === null || typeof node !== 'object') return null;
+  if (predicate(node)) return node;
+  for (const val of Object.values(node)) {
+    if (val && typeof val === 'object') {
+      const found = findFirst(val, predicate, depth + 1);
+      if (found) return found;
+    }
+  }
+  return null;
 }
 
 // ── PARSE RAW RESPONSE ───────────────────────────────────────
@@ -1992,6 +2152,70 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
   if (!product.brand)        product.brand        = raw['@_Manuf']           || raw.Manuf           || raw.brand    || product.brand || null;
   if (!product.ean)          product.ean          = raw['@_Ean']             || raw.Ean             || raw.ean      || raw.EAN   || raw.first_ean || raw.EAN1 || product.ean || null;
   if (!product.subcategory)  product.subcategory  = raw['@_SubClassCode']    || raw.SubClassCode    || raw.product_type || product.subcategory || null;
+
+  // ── AB.pl (AB S.A.) product feed fields ─────────────────────────
+  // req=products_all / req=product response fields (per AB's XML
+  // Gateway docs — see the VERIFY note on the xml_post_abpl branch in
+  // fetchEndpoint(): exact nesting confirmed field-by-field below is
+  // NOT yet checked against a live response).
+  if (!product.sku) product.sku = raw.abpn || product.sku || '';
+  if (!product.name) {
+    // `name` may come back as a plain string or a per-language object
+    // (docs say "localized name") — handle both.
+    const n = raw.name;
+    product.name = (typeof n === 'object' ? (n.pl || n['#text'] || Object.values(n)[0]) : n) || product.name || 'Unknown';
+  }
+  if (!product.ean) product.ean = raw.ean || product.ean || null;
+  if (!product.brand && raw.producer_id) product.brand = String(raw.producer_id); // resolved to a real name via req=producers — see setup notes
+  if (!product.cost_price || product.cost_price === 0) {
+    product.cost_price = parseFloat(raw.price) || product.cost_price || 0;
+  }
+  if (product.stock_qty == null || product.stock_qty === 0) {
+    // instock may be a bare number or a per-site/division breakdown —
+    // sum whatever numeric values are present either way.
+    if (raw.instock !== undefined) {
+      const inst = raw.instock;
+      if (typeof inst === 'object') {
+        product.stock_qty = Object.values(inst).reduce((sum, v) => {
+          const n = parseInt(typeof v === 'object' ? v['#text'] : v, 10);
+          return sum + (Number.isFinite(n) ? n : 0);
+        }, 0);
+      } else {
+        product.stock_qty = parseInt(inst, 10) || 0;
+      }
+    }
+  }
+  if (!product.image_url && raw.images) {
+    // images may be a single object or an array — take the first
+    // image_url (see ABClient's note: response includes a direct
+    // image_url CDN link, no need to decode the accompanying base64).
+    const imgs = Array.isArray(raw.images) ? raw.images : [raw.images];
+    const urls = imgs.map(i => i?.image_url || i?.url).filter(Boolean);
+    if (urls.length) {
+      product.image_url = urls[0];
+      if (urls.length > 1) product.images_all = urls.join('|');
+    }
+  }
+  if (!product.description) {
+    product.description = raw.description || (typeof raw.desc === 'string' ? raw.desc : null);
+  }
+  // vendpn (manufacturer SKU), guarantee_type, size_class, ep_id — kept
+  // in specs for reference / BigHub feed / shipping-cost lookups.
+  // ep_id specifically drives safeguard #2 in ABClient.js (orders
+  // cannot mix normal + "external" ep_id!=0 products) — Odoo's push of
+  // x_specifications carries it through so orderRouter.js can read it
+  // back off the product row when building an order line.
+  if (raw.vendpn || raw.guarantee_type || raw.size_class || raw.ep_id !== undefined) {
+    product.specs = product.specs || {};
+    if (raw.vendpn)         product.specs.vendor_sku    = raw.vendpn;
+    if (raw.guarantee_type) product.specs.warranty_type = raw.guarantee_type; // N/R/Z/W
+    if (raw.size_class)     product.specs.ab_size_class = raw.size_class;
+    if (raw.ep_id !== undefined) product.specs.ab_ep_id = String(raw.ep_id);
+  }
+  if (raw.weight && !product.specs?.weight) {
+    product.specs = product.specs || {};
+    product.specs.weight = raw.weight;
+  }
 
   // ── Mediamax Complete Catalog fields ──────────────────────────────
   // image1…image5: up to 5 separate image columns (CSV feeds)
