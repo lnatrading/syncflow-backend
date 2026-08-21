@@ -4,17 +4,16 @@
 //  tracking/status lookup.
 //  Docs source: AB Online → Administration → XML Gateway (dealer portal).
 //
-//  ⚠ VERIFY BEFORE PRODUCTION — the exact response XML nesting for
-//  each req= call (root element names, whether <error>/<code> are
-//  elements or attributes, whether <instock> is a bare number or a
-//  per-site breakdown object) was NOT available as a live sample
-//  when this file was written — only the field/param list from AB's
-//  docs. All parsing here is written defensively (multiple fallback
-//  paths) but MUST be checked against real Postman responses before
-//  this client is trusted with a live "test_order":0 order. Every
-//  place that needs verification is marked with a "VERIFY:" comment.
-//  Ahmed's own workflow is to confirm response shape in Postman before
-//  finalising parser code — do that here before removing test_order.
+//  ⚠ VERIFY BEFORE PRODUCTION — root shape and error format ARE now
+//  confirmed via Postman (Aug 2026): every response is
+//    <gateway><timestamp>...</timestamp><...request-specific data...></gateway>
+//  errors are <gateway><error><code>N</code><message>text</message></error></gateway>.
+//  STILL UNCONFIRMED: the request-specific wrapper tag names for
+//  products_all/product/stocks/regaddr/checkticket/orders (only pterms
+//  has been checked so far — see AB_PL_SETUP.md for the checklist of
+//  remaining calls to run). Places still relying on the generic
+//  tree-search fallback rather than a confirmed exact path are marked
+//  "VERIFY:" below — tighten each one as you check it in Postman.
 // ============================================================
 const axios = require('axios');
 const { XMLParser } = require('fast-xml-parser');
@@ -58,12 +57,19 @@ const ERROR_CODES = {
   21: 'No such ticket_id',
   22: 'Cache-only request had no cached response',
   44: 'Duplicate own_number (unichk=1)',
+  // Confirmed via Postman (Aug 2026) — not in the originally documented
+  // table: address creation still in progress (checkticket, expected
+  // while the ticket is unresolved — see RETRYABLE_CODES).
+  60: 'Address creation is in progress',
+  // Confirmed via Postman (Aug 2026) — not in the originally documented
+  // table: IP not on the account's XML Gateway allowlist.
+  59: 'IP without login permission (IP not added under AB Online → Administration → XML Gateway IPs)',
 };
 
 // Codes that mean "try again later, this is expected" — not a bug in our
 // request. Safeguard #7 (error 1 nightly window) and #8-adjacent (rate
 // limiting) both fall here.
-const RETRYABLE_CODES = new Set([1, 8]);
+const RETRYABLE_CODES = new Set([1, 8, 60]);
 
 // ============================================================
 //  LOW-LEVEL REQUEST HELPERS
@@ -86,13 +92,25 @@ function buildFormBody(params) {
   return usp;
 }
 
-// VERIFY: error surface shape. Tries the plausible shapes documented by
-// similar PHP-gateway APIs (top-level <error>, or <response><error>,
-// or a <code>/<errorTekst>-style pair like DCS). Widen this once the
-// real shape is confirmed in Postman.
+// CONFIRMED (Postman, Aug 2026): AB's actual error shape is
+//   <gateway><error><code>2</code><message>missing authentication data [c=0;l=10]</message></error></gateway>
+// i.e. root <gateway>, error nested one level under <error>, both
+// <code> and <message> as child elements (not attributes). Checked
+// directly first; the old speculative fallbacks are kept underneath
+// in case a different req= call ever returns a different shape.
 function extractAbError(parsed) {
   if (!parsed || typeof parsed !== 'object') return null;
 
+  const direct = parsed.gateway?.error;
+  if (direct && (direct.code !== undefined)) {
+    const code = parseInt(typeof direct.code === 'object' ? direct.code['#text'] : direct.code, 10);
+    if (code) {
+      const message = direct.message || ERROR_CODES[code] || 'Unknown AB.pl error';
+      return { code, message: String(message) };
+    }
+  }
+
+  // Fallback for any req= call that doesn't match the confirmed shape above.
   const candidates = [parsed, ...Object.values(parsed).filter(v => v && typeof v === 'object')];
   for (const node of candidates) {
     if (!node || typeof node !== 'object') continue;
@@ -324,22 +342,30 @@ async function pollPendingAddresses(supabase) {
   let resolved = 0;
   for (const row of pending) {
     try {
+      // CONFIRMED (Postman, Aug 2026): a not-yet-ready ticket comes back
+      // as an ERROR (code 60 "address creation is in progress"), not a
+      // success response with a status=0 field as originally guessed —
+      // postAb() throws in that case, caught below and treated as a
+      // quiet no-op, not a failure.
       const { parsed } = await postAb('checkticket', { ticket_id: row.ticket_id }, { label: 'AB checkticket' });
-      // VERIFY: exact tag names for status / address_code in checkticket response.
-      const status      = findFirstValue(parsed, ['status']);
+      // VERIFY: exact tag name for address_code on a resolved ticket —
+      // not yet seen, since ticket 3569898 was still processing as of
+      // the last check. Confirm this the next time a ticket completes.
       const addressCode = findFirstValue(parsed, ['address_code', 'addressCode']);
-
-      if (String(status) === '1' && addressCode) {
+      if (addressCode) {
         await supabase.from('ab_addresses').update({
           status: 'ready', address_code: String(addressCode), updated_at: new Date(),
         }).eq('id', row.id);
         resolved++;
-      } else if (String(status) === '0') {
-        // still generating — leave as pending, poll again next tick
       } else {
-        console.warn(`[AB] Ticket ${row.ticket_id} returned unexpected status "${status}" — leaving pending for manual review`);
+        console.warn(`[AB] Ticket ${row.ticket_id} resolved with no address_code found — response shape needs checking`);
       }
     } catch (err) {
+      if (err.abErrorCode === 60) {
+        // Still generating — expected, not an error. Leave as pending,
+        // poll again next tick. No log spam, no row.error write.
+        continue;
+      }
       console.warn(`[AB] checkticket failed for ticket ${row.ticket_id}: ${err.message}`);
       await supabase.from('ab_addresses').update({
         error: err.message, updated_at: new Date(),
@@ -363,9 +389,12 @@ function findFirstValue(obj, keys, depth = 0) {
   return null;
 }
 
-// ============================================================
-//  ORDER PLACEMENT (safeguards #2, #3, #4, #6-precheck)
-// ============================================================
+// CONFIRMED (Postman, Aug 2026): despite the docs listing several
+// placeorder params as optional (comment, concat_last_order, etc.),
+// the gateway actually rejects the call with error 6 ("request
+// parameter missing") if they're absent — it wants them present even
+// when empty/zero. Send every documented placeorder param explicitly
+// rather than omitting "optional" ones.
 
 // order shape (matches orderRouter.js's bucket → placeOrder contract):
 //   odoo_sale_ref, lines: [{ sku (=abpn), quantity, unit_price?, is_external? }],
@@ -435,12 +464,20 @@ async function placeSingleAbOrder(order, lines, splitSuffix) {
     shipping_address:      shippingAddressCode,
     invoice_address:       order.invoice_address_code || shippingAddressCode,
     delivery_method:       order.ab_delivery_method || 2, // 2 = courier (default; 1 = Wrocław city delivery only)
-    payment_term:          order.ab_payment_term || process.env.AB_DEFAULT_PAYMENT_TERM || 'DH-P-01',
+    payment_term:          order.ab_payment_term || process.env.AB_DEFAULT_PAYMENT_TERM || 'DH-P-01', // CONFIRMED active on this account via req=pterms (Aug 2026) — "PRZELEW 1 DZIEŃ" (transfer, 1 day)
     allow_addition:        1,
     allow_multiple_divisions: 1,
     require_contact:       0,
-    comment:               order.comment || '',
-    own_number:            ownNumber,
+    comment:                order.comment || '',
+    own_number:             ownNumber,
+    // CONFIRMED (Postman, Aug 2026): despite being documented as
+    // optional, AB rejects placeorder with error 6 if these are simply
+    // absent — send them explicitly with safe defaults every time.
+    concat_last_order:      0,
+    cod_amt:                order.ab_cod_amt || 0,
+    aon:                    order.ab_all_or_nothing ? 1 : 0,
+    proforma_em:            order.ab_proforma_email || '',
+    wz_cmmt:                order.ab_wz_comment || '',
     // Safeguard #4: idempotency — reject a duplicate own_number outright
     // rather than silently double-placing on a retried call.
     unichk:                1,
@@ -511,15 +548,27 @@ async function calculateShipmentCost(lines) {
 }
 
 // ============================================================
-//  TRACKING (req=orders / req=shipments)
+//  TRACKING (req=orders)
 //  Interface matches what trackingPoller.js expects.
 // ============================================================
-const AB_STATUS_MAP = {
-  NEW:   'placed',
-  PEND:  'shipped',
-  DONE:  'delivered',
-  ERROR: 'error',
-  NF:    'shipped', // waybill not found yet — still treat as shipped/in transit
+// CONFIRMED (Postman, Aug 2026) against real order 15259967: the
+// request param is own_number (already correct below), but the
+// RESPONSE field is own_nbr — a different name, not a typo on our
+// side. status is the numeric order-status code already documented
+// elsewhere (1=new, 2=realization in progress, 3=realized, 4=canceled,
+// 5=contact required, 24=processing/internal) — NOT the NEW/PEND/DONE
+// string set, which belongs to a different endpoint (req=shipments,
+// not yet exercised). Tracking number lives in speditor_waybill, not
+// a plain waybill field.
+const ORDER_STATUS_MAP = {
+  1:  'placed',   // new
+  2:  'placed',   // realization in progress
+  3:  'shipped',  // realized — best-available mapping; AB doesn't
+                  // document a distinct "delivered" code, so this is
+                  // the most advanced state inferable from status alone
+  4:  'error',    // canceled
+  5:  'error',    // contact required — needs a human, surfaced as error
+  24: 'placed',   // processing (internal)
 };
 
 async function getBatchTracking(ownNumbers) {
@@ -544,30 +593,29 @@ async function getTracking(ownNumber) {
   const orderNode = findOrderNode(parsed, ownNumber);
   if (!orderNode) return { status: 'placed', tracking_number: null, tracking_url: null, carrier: null };
 
-  // VERIFY: exact status field name/values on the order node.
-  const abStatusRaw = findFirstValue(orderNode, ['ab_status', 'status']);
-  const status = AB_STATUS_MAP[String(abStatusRaw).toUpperCase()] || 'placed';
+  const statusCode = parseInt(findFirstValue(orderNode, ['status']), 10);
+  const trackingNumber = findFirstValue(orderNode, ['speditor_waybill']) || null;
+  // A real waybill is a stronger signal than the numeric status alone —
+  // promote to 'shipped' whenever one is present, regardless of status.
+  const status = trackingNumber ? 'shipped' : (ORDER_STATUS_MAP[statusCode] || 'placed');
 
   return {
     status,
-    tracking_number: findFirstValue(orderNode, ['waybill', 'tracking_number']) || null,
+    tracking_number: trackingNumber,
     tracking_url:    null, // AB doesn't document a direct tracking URL
-    carrier:          findFirstValue(orderNode, ['speditor', 'carrier']) || null,
+    carrier:          findFirstValue(orderNode, ['speditor']) || null,
   };
 }
 
 function findOrderNode(parsed, ownNumber) {
-  const arr = findProductArray(parsed) || [];
-  // findProductArray looks for abpn/id — orders won't match that, so
-  // fall back to a dedicated walk here.
   const nodes = [];
   (function walk(obj, depth = 0) {
-    if (!obj || typeof obj !== 'object' || depth > 4) return;
+    if (!obj || typeof obj !== 'object' || depth > 5) return;
     if (Array.isArray(obj)) { obj.forEach(o => walk(o, depth + 1)); return; }
-    if ('own_number' in obj || 'ownNumber' in obj) nodes.push(obj);
+    if ('own_nbr' in obj) nodes.push(obj);
     for (const v of Object.values(obj)) if (v && typeof v === 'object') walk(v, depth + 1);
   })(parsed);
-  return nodes.find(n => String(n.own_number ?? n.ownNumber) === String(ownNumber)) || nodes[0] || null;
+  return nodes.find(n => String(n.own_nbr) === String(ownNumber)) || nodes[0] || null;
 }
 
 module.exports = {
