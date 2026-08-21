@@ -11,6 +11,7 @@ const syncEngine        = require('./syncEngine');
 const odooClient        = require('./odooClient');
 const { pollTracking }  = require('./trackingPoller');
 const { retryFailedOrders } = require('./orderRouter');
+const { pollPendingAddresses } = require('./orderClients/ABClient');
 const { requireApiKey } = require('./middleware/auth');
 
 const app  = express();
@@ -155,6 +156,20 @@ cron.schedule('*/30 * * * *', async () => {
     ]);
   } catch (err) {
     console.error('[TRACKING CRON] Error:', err.message);
+  }
+});
+
+// ── CRON: resolve pending AB.pl address tickets every 5 minutes ────
+// regaddr (AB.pl address registration) is async — a ticket_id takes a
+// few minutes to become an address_code. This finishes what
+// ABClient.registerAddress() started, independent of any order flow.
+// See orderClients/ABClient.js safeguard #5 for the full rationale.
+cron.schedule('*/5 * * * *', async () => {
+  try {
+    const { checked, resolved } = await pollPendingAddresses(supabase);
+    if (checked) console.log(`[AB ADDRESS POLL] Checked ${checked} pending ticket(s), resolved ${resolved}`);
+  } catch (err) {
+    console.error('[AB ADDRESS POLL] Error:', err.message);
   }
 });
 
