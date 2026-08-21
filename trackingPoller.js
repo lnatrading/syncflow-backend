@@ -8,6 +8,7 @@ const ElkoClient     = require('./orderClients/ElkoClient');
 const BigBuyClient   = require('./orderClients/BigBuyClient');
 const MediamaxClient = require('./orderClients/MediamaxClient');
 const TDBalticClient = require('./orderClients/TDBaltcClient');
+const ABClient       = require('./orderClients/ABClient');
 const odooClient     = require('./odooClient');
 
 const CLIENTS = [
@@ -15,6 +16,7 @@ const CLIENTS = [
   { match: ['bigbuy','big buy'],              client: BigBuyClient   },
   { match: ['mediamax'],                      client: MediamaxClient },
   { match: ['tdbaltic','td baltic','td_baltic'], client: TDBalticClient },
+  { match: ['ab.pl','ab s.a.','ab sa','abpl'],  client: ABClient       },
 ];
 
 function getClient(supplierName) {
