@@ -41,7 +41,7 @@ const ERROR_CODES = {
   5:  'Bad request (unknown req value)',
   6:  'Required request param missing',
   7:  'Bad request param',
-  8:  'Excessive usage (rate limit)',
+  8:  'Excessive usage (rate limit) — confirmed in production: this is a BANDWIDTH limit specifically; caching (use_cache/cache_refresh) is the actual mitigation, not just call frequency',
   9:  'Account locked',
   10: 'Unknown error',
   11: 'Order item price mismatch',
@@ -130,12 +130,18 @@ async function postAb(reqName, extraParams = {}, { timeoutMs = 30000, label } = 
     client: CLIENT_CODE,
     login:  LOGIN,
     pass:   PASSWORD,
-    // Safeguard #1: always send use_cache + cache_refresh together on
-    // read requests, per AB's own recommendation, to avoid error 8.
-    // Harmless to include on write requests too — AB ignores unknown
-    // params on those calls.
+    // CONFIRMED (production, Aug 2026): sending cache_refresh=1 on every
+    // call was wrong — real error hit on the sync side: "error 8,
+    // excessive BANDWIDTH usage, cache the damn thing yourself". Unlike
+    // the bulk products_all feed (see syncEngine.js's xml_post_abpl
+    // branch, which now defaults to use_cache=2), these order-side calls
+    // are small single-item lookups where freshness genuinely matters
+    // (a stale cached price during the safeguard #3 price-mismatch retry
+    // would defeat its whole purpose) — so keep use_cache=1 (cache only
+    // as an error-8 fallback, not proactively) but stop forcing a refresh
+    // on every call.
     use_cache:     extraParams.use_cache     ?? 1,
-    cache_refresh: extraParams.cache_refresh ?? 1,
+    cache_refresh: extraParams.cache_refresh ?? 0,
     ...extraParams,
   });
 
