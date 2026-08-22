@@ -1272,10 +1272,21 @@ async function fetchEndpoint(urlTemplate, format, auth, templateValues = {}) {
     bodyParams.set('client', auth.extra?.client || '');
     bodyParams.set('login',  auth.username || '');
     bodyParams.set('pass',   auth.password || '');
-    // Safeguard #1: always send use_cache + cache_refresh together on
-    // read requests — AB's own docs recommend this to avoid error 8.
-    bodyParams.set('use_cache',     extraQuery.use_cache     ?? '1');
-    bodyParams.set('cache_refresh', extraQuery.cache_refresh ?? '1');
+    // CONFIRMED (production, Aug 2026): sending cache_refresh=1 on every
+    // call was wrong — real error hit: "error 8, excessive BANDWIDTH
+    // usage, cache the damn thing yourself". cache_refresh=1 forces AB to
+    // regenerate/refresh its cache on every single call, so nothing was
+    // ever actually served from cache — every manual "Sync Now" click on
+    // the ~40k-row products_all feed counted as full fresh bandwidth.
+    // Fixed: default use_cache=2 (always serve from AB's cache when
+    // available) and cache_refresh=0 (don't force a refresh) — this is
+    // what actually reduces bandwidth on repeated calls, which is what
+    // safeguard #1 was supposed to achieve in the first place. The
+    // endpoint's own 24h sync_freq_minutes already ensures we only need
+    // genuinely fresh data once a day; a slightly-stale cached response
+    // the rest of the time is the correct tradeoff, not a workaround.
+    bodyParams.set('use_cache',     extraQuery.use_cache     ?? '2');
+    bodyParams.set('cache_refresh', extraQuery.cache_refresh ?? '0');
     for (const [k, v] of Object.entries(extraQuery)) {
       if (k === 'use_cache' || k === 'cache_refresh') continue;
       bodyParams.set(k, v);
@@ -1327,6 +1338,18 @@ async function fetchEndpoint(urlTemplate, format, auth, templateValues = {}) {
         if (code === 1) {
           err.expected = true;
           err.message = 'AB.pl temporarily unavailable (nightly data-replication window) — will retry on next scheduled sync';
+        }
+        // CONFIRMED in production (Aug 2026): error 8 (bandwidth rate
+        // limit) hit on the ~40k-row products_all feed after repeated
+        // manual "Sync Now" calls before the use_cache/cache_refresh fix
+        // above. Now that cache_refresh is no longer forced on every
+        // call, this should be rare — but if it does recur (e.g. several
+        // manual syncs in quick succession), treat it the same way as
+        // error 1: routine, self-resolving, not worth a "Sync failed"
+        // alert.
+        if (code === 8) {
+          err.expected = true;
+          err.message = 'AB.pl bandwidth rate limit hit — will retry on next scheduled sync (cache should prevent this recurring under normal cron cadence)';
         }
         throw err;
       }
