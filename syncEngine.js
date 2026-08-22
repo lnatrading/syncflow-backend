@@ -115,7 +115,15 @@ async function runSupplierSyncInner(supabase, supplier) {
       const catUrl = versionResolver.resolveEndpointUrl(categoriesEndpoint, activeVersion);
       const rawCategories = await fetchEndpoint(catUrl, categoriesEndpoint.format, auth)
         .catch(e => { console.warn('[SYNC] Categories fetch failed:', e.message); return []; });
+      console.log(`[SYNC] ${supplier.name} — fetched ${rawCategories.length} category record(s)`);
+      if (rawCategories.length) {
+        console.log(`[SYNC] ${supplier.name} — sample category:`, JSON.stringify(rawCategories[0]));
+      }
+      const productsWithCatId = rawProducts.filter(p => p.categoryId != null).length;
+      console.log(`[SYNC] ${supplier.name} — ${productsWithCatId}/${rawProducts.length} raw products have a categoryId set`);
       rawProducts = mergeCategories(rawProducts, rawCategories);
+      const resolvedCount = rawProducts.filter(p => p._resolvedCategory).length;
+      console.log(`[SYNC] ${supplier.name} — ${resolvedCount} product(s) got a _resolvedCategory after merge`);
     }
 
     // 4. Fetch static (non-parameterised) secondary endpoints and merge
@@ -1297,17 +1305,21 @@ async function fetchEndpoint(urlTemplate, format, auth, templateValues = {}) {
       throw new Error(`AB.pl ${reqName}: failed to parse XML response — ${e.message} | Preview: ${String(response.data).slice(0, 200)}`);
     }
 
-    // Error surface — see the same VERIFY note as ABClient.js's
-    // extractAbError(). Kept as a small local copy rather than importing
-    // from orderClients/ABClient.js to avoid coupling the sync path to
-    // the order-placement client module.
-    const errNode = findFirst(parsed, n => n && typeof n === 'object' &&
-      (n.error !== undefined || n.code !== undefined));
+    // CONFIRMED (Postman, Aug 2026): <gateway><error><code>N</code>
+    // <message>text</message></error></gateway>. Checked directly first,
+    // with the old speculative tree-search kept as a fallback for any
+    // req= call that returns a shape we haven't hit yet.
+    const directErr = parsed.gateway?.error;
+    const errNode = (directErr && directErr.code !== undefined)
+      ? directErr
+      : findFirst(parsed, n => n && typeof n === 'object' &&
+          (n.error !== undefined || n.code !== undefined));
     if (errNode) {
       const rawCode = errNode.error ?? errNode.code;
       const code = parseInt(typeof rawCode === 'object' ? rawCode['#text'] : rawCode, 10);
       if (code) {
-        const err = new Error(`AB.pl ${reqName} error ${code}`);
+        const message = errNode.message ? ` — ${errNode.message}` : '';
+        const err = new Error(`AB.pl ${reqName} error ${code}${message}`);
         // Safeguard #7: error 1 (nightly data-replication window) is a
         // routine, expected condition — not a bug in our request and not
         // worth an alert. The scheduler's normal per-endpoint retry on
@@ -1326,6 +1338,20 @@ async function fetchEndpoint(urlTemplate, format, auth, templateValues = {}) {
       typeof n[0] === 'object' && ('id' in n[0] || 'abpn' in n[0] || 'parentid' in n[0]));
     if (!arr) return [];
 
+    // CONFIRMED (Postman, Aug 2026): req=groups is a FLAT parentid-linked
+    // list (id, parentid, name, has_filters, special, locales[]) — root
+    // categories have parentid=0. Matches the assumption already baked
+    // into mergeCategories()'s generic id/name lookup. NOT hierarchical
+    // in the response itself (see the "known gap" note in AB_PL_SETUP.md
+    // — a dedicated tree-walker isn't built yet, categories still surface
+    // via the generic per-product path/6c-derivation instead).
+    //
+    // CONFIRMED: some group <name> values contain embedded HTML markup
+    // (e.g. "<b style=\"color:black\">Black Friday</b>") — AB uses this
+    // for promotional category styling on their own site. Strip tags so
+    // a clean label reaches Odoo/BigHub rather than raw HTML.
+    const stripHtml = s => typeof s === 'string' ? s.replace(/<[^>]*>/g, '').trim() : s;
+
     // req=products_all items carry `groups` (an array of category ids a
     // product belongs to per the docs). mergeCategories() (called
     // generically for any supplier with a role:'categories' endpoint —
@@ -1333,14 +1359,24 @@ async function fetchEndpoint(urlTemplate, format, auth, templateValues = {}) {
     // categoryId field, so alias the first group id here. A product's
     // full multi-category membership stays available on raw.groups for
     // anything that wants it later (not currently used beyond this).
+    // CONFIRMED (Postman, Aug 2026): a product's groups field is
+    // <groups><group><id>N</id></group></groups> — parses to
+    // { group: { id: N } } for one category, or { group: [{id:N},...] }
+    // for several. Nested under 'group', not the '.item'/flat-array
+    // shapes originally guessed. Extract the first category id here,
+    // before mergeCategories() runs, so its p.categoryId matching
+    // (against req=groups' id/name lookup) actually resolves.
     return arr.map(item => {
-      if (item.groups !== undefined && item.categoryId === undefined) {
-        const groupList = Array.isArray(item.groups) ? item.groups
-          : (item.groups?.item ?? item.groups); // VERIFY: array wrapper shape
-        const first = Array.isArray(groupList) ? groupList[0] : groupList;
-        if (first !== undefined) return { ...item, categoryId: first };
+      let out = item;
+      if (typeof out.name === 'string' && out.name.includes('<')) {
+        out = { ...out, name: stripHtml(out.name) };
       }
-      return item;
+      if (out.groups?.group !== undefined && out.categoryId === undefined) {
+        const groupList = Array.isArray(out.groups.group) ? out.groups.group : [out.groups.group];
+        const first = groupList[0]?.id ?? groupList[0];
+        if (first !== undefined) out = { ...out, categoryId: first };
+      }
+      return out;
     });
   }
 
@@ -2154,16 +2190,23 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
   if (!product.subcategory)  product.subcategory  = raw['@_SubClassCode']    || raw.SubClassCode    || raw.product_type || product.subcategory || null;
 
   // ── AB.pl (AB S.A.) product feed fields ─────────────────────────
-  // req=products_all / req=product response fields (per AB's XML
-  // Gateway docs — see the VERIFY note on the xml_post_abpl branch in
-  // fetchEndpoint(): exact nesting confirmed field-by-field below is
-  // NOT yet checked against a live response).
+  // req=products_all response CONFIRMED via Postman (Aug 2026) —
+  // <gateway><timestamp>...</timestamp><products><product>...
+  // Real fields seen: id, abpn (CDATA), ep_id, is_toy, split_payment,
+  // reservation_not_allowed/eol (attrs + text), modified, vendpn (CDATA),
+  // ean (CDATA), dimentions{width,height,depth,weight} — NOTE: AB's own
+  // typo "dimentions", not ours — name (lang attr + CDATA text, single
+  // language since langs=1 was requested), currency, price, vat,
+  // guarantee_type, guarantee, producer_id, instock, images>imageid
+  // (attrs is_main/is_infographic + numeric id — NOT a URL, see below),
+  // groups>group>id (nested, not a flat array).
   if (!product.sku) product.sku = raw.abpn || product.sku || '';
   if (!product.name) {
-    // `name` may come back as a plain string or a per-language object
-    // (docs say "localized name") — handle both.
+    // Confirmed: <name lang="1">CDATA</name> → { '@_lang': '1', '#text': '...' }
+    // when parsed (attribute + text content together), or a plain string
+    // if no attribute survives a given parse path — handle both.
     const n = raw.name;
-    product.name = (typeof n === 'object' ? (n.pl || n['#text'] || Object.values(n)[0]) : n) || product.name || 'Unknown';
+    product.name = (typeof n === 'object' ? (n['#text'] ?? n.pl ?? Object.values(n).find(v => typeof v === 'string')) : n) || product.name || 'Unknown';
   }
   if (!product.ean) product.ean = raw.ean || product.ean || null;
   if (!product.brand && raw.producer_id) product.brand = String(raw.producer_id); // resolved to a real name via req=producers — see setup notes
@@ -2171,29 +2214,35 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
     product.cost_price = parseFloat(raw.price) || product.cost_price || 0;
   }
   if (product.stock_qty == null || product.stock_qty === 0) {
-    // instock may be a bare number or a per-site/division breakdown —
-    // sum whatever numeric values are present either way.
-    if (raw.instock !== undefined) {
-      const inst = raw.instock;
-      if (typeof inst === 'object') {
-        product.stock_qty = Object.values(inst).reduce((sum, v) => {
-          const n = parseInt(typeof v === 'object' ? v['#text'] : v, 10);
-          return sum + (Number.isFinite(n) ? n : 0);
-        }, 0);
-      } else {
-        product.stock_qty = parseInt(inst, 10) || 0;
+    // CONFIRMED: instock is a STRING like "30+" (meaning "30 or more"),
+    // not a bare number or per-site object as originally guessed. Strip
+    // any trailing "+" and parse the leading digits; store whether it
+    // was a "+" (uncapped) figure in specs for anyone who cares later.
+    if (raw.instock !== undefined && raw.instock !== null) {
+      const instockStr = String(raw.instock).trim();
+      const isPlus = instockStr.endsWith('+');
+      product.stock_qty = parseInt(instockStr, 10) || 0;
+      if (isPlus) {
+        product.specs = product.specs || {};
+        product.specs.ab_instock_uncapped = true;
       }
     }
   }
-  if (!product.image_url && raw.images) {
-    // images may be a single object or an array — take the first
-    // image_url (see ABClient's note: response includes a direct
-    // image_url CDN link, no need to decode the accompanying base64).
-    const imgs = Array.isArray(raw.images) ? raw.images : [raw.images];
-    const urls = imgs.map(i => i?.image_url || i?.url).filter(Boolean);
-    if (urls.length) {
-      product.image_url = urls[0];
-      if (urls.length > 1) product.images_all = urls.join('|');
+  // CONFIRMED: the products_all feed's <images> only carries an
+  // <imageid> reference (plus is_main/is_infographic attrs) — NOT a
+  // direct URL as the docs' field list implied. A real image_url only
+  // comes from a separate req=image call (rate-limited to 1/sec per the
+  // rate table — not viable to call per-product during a full sync).
+  // Store the main imageid for a future/background image-resolution
+  // pass rather than leaving a silently-wrong image_url in place.
+  if (!product.image_url && raw.images?.imageid !== undefined) {
+    const imgs = Array.isArray(raw.images.imageid) ? raw.images.imageid : [raw.images.imageid];
+    const mainImg = imgs.find(i => typeof i === 'object' && i['@_is_main'] === '1') || imgs[0];
+    const imageId = typeof mainImg === 'object' ? mainImg['#text'] : mainImg;
+    if (imageId) {
+      product.specs = product.specs || {};
+      product.specs.ab_main_image_id = String(imageId);
+      // No req=image call made here — see AB_PL_SETUP.md follow-up items.
     }
   }
   if (!product.description) {
@@ -2212,10 +2261,18 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
     if (raw.size_class)     product.specs.ab_size_class = raw.size_class;
     if (raw.ep_id !== undefined) product.specs.ab_ep_id = String(raw.ep_id);
   }
-  if (raw.weight && !product.specs?.weight) {
+  // CONFIRMED: weight/dimensions are nested under <dimentions> (AB's own
+  // typo), not flat top-level fields as originally guessed.
+  if (raw.dimentions?.weight && !product.specs?.weight) {
     product.specs = product.specs || {};
-    product.specs.weight = raw.weight;
+    product.specs.weight = raw.dimentions.weight;
+    if (raw.dimentions.width)  product.specs.width  = raw.dimentions.width;
+    if (raw.dimentions.height) product.specs.height = raw.dimentions.height;
+    if (raw.dimentions.depth)  product.specs.depth  = raw.dimentions.depth;
   }
+  // AB's per-product category structure is confirmed below (fetchEndpoint's
+  // xml_post_abpl branch) — matched there, before mergeCategories() runs,
+  // not here.
 
   // ── Mediamax Complete Catalog fields ──────────────────────────────
   // image1…image5: up to 5 separate image columns (CSV feeds)
