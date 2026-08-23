@@ -686,6 +686,7 @@ async function runSupplierSyncInner(supabase, supplier) {
         sku:         product.sku,
         ean:         product.ean || product.barcode || product.gtin || null,
         name:        product.name,
+        brand:       product.brand       || null,
         description: product.description || null,
         category:    product.category    || null,
         cost_price:  product.cost_price  || 0,
