@@ -202,6 +202,7 @@ async function upsertBatch(config, products) {
 
   const existingBySku     = Object.fromEntries(existing.filter(r => r.default_code).map(r => [r.default_code, r.id]));
   const existingByBarcode = Object.fromEntries(existing.filter(r => r.barcode).map(r => [r.barcode, r.id]));
+  const existingBarcodeById = Object.fromEntries(existing.map(r => [r.id, r.barcode || false]));
 
   const toCreate = [];
   const toUpdate = []; // [{ odoo_id, values }]
@@ -263,6 +264,25 @@ async function upsertBatch(config, products) {
       // SKU/reference on their product could break their ability to find
       // and re-sync it later. We still update price/stock/description/etc.
       delete values.default_code;
+    }
+
+    // FIX (Aug 2026): Odoo's barcode-uniqueness constraint re-validates the
+    // WHOLE record on every write() call, not just changed fields. Because
+    // this update unconditionally re-sent `barcode` even when it already
+    // matched what's stored, every product whose barcode happens to
+    // collide with a genuinely-duplicate value on some OTHER record
+    // (an old, separate data-quality issue — two records independently
+    // holding the same real-world EAN) failed on every single sync run,
+    // forever — not because anything was actually changing, but because
+    // reasserting an already-correct value still re-triggers the
+    // constraint check against the other record. Skipping the field when
+    // it's unchanged removes this entire recurring-failure class; a
+    // genuinely NEW or DIFFERENT barcode still gets sent and can still
+    // legitimately fail if it collides with another record, which is
+    // correct — that's a real, currently-unresolved duplicate worth
+    // seeing, not one to hide.
+    if (matchedId && existingBarcodeById[matchedId] === values.barcode) {
+      delete values.barcode;
     }
 
     if (matchedId) {
