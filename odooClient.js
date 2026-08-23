@@ -93,6 +93,15 @@ function sanitizeXmlText(str) {
   // accidentally deleting the valid character preceding a lone low
   // surrogate — verified against test cases before shipping.
   s = s.replace(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])|([^\uD800-\uDBFF]|^)[\uDC00-\uDFFF]/g, '$1');
+  // NEW (Aug 2026): U+FFFE and U+FFFF are explicitly excluded from XML
+  // 1.0's valid Char production (spec range is [#xE000-#xFFFD], NOT
+  // ...-#xFFFF) — these aren't control characters, so the strip above
+  // never touched them. They show up from corrupted/mismatched-encoding
+  // source text (e.g. a stray BOM/replacement leftover) same as the lone
+  // surrogates above, and previously reached Odoo's XML-RPC layer
+  // untouched, causing a bare "Invalid XML-RPC message" with no
+  // indication of which field/character caused it.
+  s = s.replace(/[\uFFFE\uFFFF]/g, '');
   return s;
 }
 
@@ -211,7 +220,7 @@ async function upsertBatch(config, products) {
 
   for (const product of products) {
     const values = {
-      name:             sanitizeXmlText(product.name),
+      name:             sanitizeXmlText(product.name) || 'Unknown',
       default_code:     sanitizeXmlText(product.sku),
       barcode:          sanitizeXmlText(product.ean) || false,
       list_price:       safeNumber(product.sale_price, 0),
@@ -295,7 +304,22 @@ async function upsertBatch(config, products) {
         config.database, uid, config.api_key,
         'product.template', 'write',
         [[odoo_id], values]
-      ]).catch(e => console.error(`[ODOO] write failed for id ${odoo_id}:`, e.message))
+      ]).catch(e => {
+        // DIAGNOSTIC (Aug 2026): "Invalid XML-RPC message" gives no
+        // indication of which field/character caused it — recurring
+        // despite sanitizeXmlText already handling known bad-char
+        // classes (control chars, lone surrogates, now U+FFFE/FFFF too).
+        // Log enough of the actual payload to spot the next bad pattern
+        // immediately instead of guessing blind from the bare error.
+        if (/Invalid XML-RPC message/i.test(e.message || '')) {
+          const suspect = ['name', 'description_sale', 'x_specifications', 'default_code']
+            .map(f => `${f}=${JSON.stringify(String(values[f] ?? '').slice(0, 80))}`)
+            .join(' | ');
+          console.error(`[ODOO] write failed for id ${odoo_id}: ${e.message} — field preview: ${suspect}`);
+        } else {
+          console.error(`[ODOO] write failed for id ${odoo_id}:`, e.message);
+        }
+      })
     ));
   }
 
@@ -386,7 +410,18 @@ async function syncVendorPricing(config, partnerId, items) {
         config.database, uid, config.api_key,
         'product.supplierinfo', 'write',
         [[supplierinfoId], { price }]
-      ]).catch(e => console.error(`[ODOO] supplierinfo write failed for template:`, e.message))
+      ]).catch(e => {
+        // NOTE (Aug 2026): this write only ever sends a plain number
+        // (price) — no text field at all. If this fails with the SAME
+        // "Invalid XML-RPC message" error as the main product.template
+        // write in the same batch window, that's a signal the bad
+        // character is corrupting something shared (the XML-RPC
+        // transport/connection for the whole concurrent window), not
+        // this call's own payload — worth checking whether these
+        // failures always cluster with a product.template failure at
+        // the same timestamp before assuming this call itself is at fault.
+        console.error(`[ODOO] supplierinfo write failed for template (price=${price}):`, e.message);
+      })
     ));
     updated += window.length;
   }
