@@ -18,6 +18,38 @@ const { loadFilterTree, evaluateProduct, getFilterBreakdown } = require('./filte
 const versionResolver = require('./apiVersionResolver');
 const { withRetry, sleep } = require('./retry');
 
+// ── AB.pl language-tagged field extraction ──────────────────────────
+// AB.pl doesn't switch which single value comes back based on the langs
+// request param — it INCLUDES one tagged entry per requested language
+// code (e.g. langs=1;3 → two <name> siblings, lang="1" Polish + lang="3"
+// English). fast-xml-parser then gives us either:
+//   - a single object   { '@_lang': '1', '#text': '...' }   (one lang requested)
+//   - an array of those  [{ '@_lang':'1',... }, { '@_lang':'3',... }]  (multiple)
+//   - a plain string (rare fallback shape, no lang survives parsing)
+// AB_LANG_EN/AB_LANG_PL are the account's confirmed language codes
+// (from req=categories' own locale data): 3 = English, 1 = Polish/default.
+// NOTE: the products endpoint URL was confirmed (Aug 2026) to request
+// ONLY langs=3 (English) — it must be changed to langs=1;3 so a Polish
+// fallback tag actually exists in the response for this to have anything
+// to select between. With only langs=3 requested, whatever AB.pl returns
+// (real English, or a mislabeled/duplicated default) is all there is.
+const AB_LANG_EN = '3';
+const AB_LANG_PL = '1';
+function abExtractLocalized(field, preferredLang = AB_LANG_EN, fallbackLang = AB_LANG_PL) {
+  if (field == null) return null;
+  if (typeof field === 'string') return field;
+  const entries = Array.isArray(field) ? field : [field];
+  const byLang = e => (e && typeof e === 'object') ? String(e['@_lang']) : null;
+  const textOf = e => (e && typeof e === 'object') ? (e['#text'] ?? null) : (typeof e === 'string' ? e : null);
+  const preferred = entries.find(e => byLang(e) === String(preferredLang));
+  if (preferred) return textOf(preferred);
+  const fallback = entries.find(e => byLang(e) === String(fallbackLang));
+  if (fallback) return textOf(fallback);
+  // Last resort: first entry with any text content at all.
+  const any = entries.find(e => textOf(e) != null);
+  return any ? textOf(any) : null;
+}
+
 // ── CHUNK SIZES ───────────────────────────────────────────────
 // Supabase upsert: 500 rows — good balance of throughput vs payload size.
 // At 500k SKUs this means 1000 DB round-trips total — acceptable.
@@ -1623,7 +1655,20 @@ function mergeCategories(products, categories) {
   const catById = {};
   for (const cat of categories) {
     const id = cat.id || cat.categoryId || cat.cat_id || cat.code;
-    if (id != null) catById[String(id)] = cat.name || cat.title || cat.label || String(id);
+    if (id != null) {
+      // Same multi-language shape as product names — req=groups can return
+      // a lang-tagged <name> (or a locales[] array, if that's the real
+      // shape once live-tested) once langs=1;3 is requested. Fall through
+      // to the plain title/label/id fields for suppliers without this.
+      let localizedName = abExtractLocalized(cat.name) || abExtractLocalized(cat.locales);
+      // The generic HTML-strip in fetchEndpoint's xml_post_abpl branch
+      // only fires when cat.name is a plain string — it never sees a
+      // lang-tagged object/array shape, so strip again here for that case.
+      if (typeof localizedName === 'string' && localizedName.includes('<')) {
+        localizedName = localizedName.replace(/<[^>]*>/g, '').trim();
+      }
+      catById[String(id)] = localizedName || cat.name || cat.title || cat.label || String(id);
+    }
   }
 
   return products.map(p => {
@@ -2235,11 +2280,12 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
   // groups>group>id (nested, not a flat array).
   if (!product.sku) product.sku = raw.abpn || product.sku || '';
   if (!product.name) {
-    // Confirmed: <name lang="1">CDATA</name> → { '@_lang': '1', '#text': '...' }
-    // when parsed (attribute + text content together), or a plain string
-    // if no attribute survives a given parse path — handle both.
-    const n = raw.name;
-    product.name = (typeof n === 'object' ? (n['#text'] ?? n.pl ?? Object.values(n).find(v => typeof v === 'string')) : n) || product.name || 'Unknown';
+    // langs request param must include BOTH codes (e.g. langs=1;3) for
+    // English to appear at all — AB.pl adds an extra tagged <name> per
+    // requested language rather than swapping which one comes back.
+    // abExtractLocalized() picks English (lang=3), falling back to
+    // Polish (lang=1) if English wasn't returned for this product.
+    product.name = abExtractLocalized(raw.name) || product.name || 'Unknown';
   }
   if (!product.ean) product.ean = raw.ean || product.ean || null;
   if (!product.brand && raw.producer_id) product.brand = String(raw.producer_id); // resolved to a real name via req=producers — see setup notes
