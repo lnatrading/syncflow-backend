@@ -16,8 +16,20 @@
 //  "VERIFY:" below — tighten each one as you check it in Postman.
 // ============================================================
 const axios = require('axios');
+const { HttpsProxyAgent } = require('https-proxy-agent');
 const { XMLParser } = require('fast-xml-parser');
 const { withRetry } = require('../retry');
+
+// Optional forward proxy for AB.pl calls specifically — set AB_PROXY_URL
+// to route around Railway's rotating outbound IP (e.g.
+// https://user:pass@your-vm-ip:8888). Uses a proper HTTPS CONNECT
+// tunnel via https-proxy-agent, so the proxy only relays encrypted
+// bytes — it never sees the actual request body (credentials, order
+// contents, etc.), same principle as a commercial static-IP proxy
+// service. Leave AB_PROXY_URL unset to call AB.pl directly (Railway's
+// own IP, whatever it is at the time).
+const AB_PROXY_URL = process.env.AB_PROXY_URL || null;
+const abProxyAgent = AB_PROXY_URL ? new HttpsProxyAgent(AB_PROXY_URL) : null;
 
 const GATEWAY_URL = process.env.AB_GATEWAY_URL || 'https://xml.ab.pl/gateway.php';
 
@@ -150,6 +162,7 @@ async function postAb(reqName, extraParams = {}, { timeoutMs = 30000, label } = 
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       timeout: timeoutMs,
       responseType: 'text',
+      ...(abProxyAgent ? { httpsAgent: abProxyAgent, proxy: false } : {}),
     });
     return res.data;
   };
