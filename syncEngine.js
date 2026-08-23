@@ -40,10 +40,23 @@ function abExtractLocalized(field, preferredLang = AB_LANG_EN, fallbackLang = AB
   if (typeof field === 'string') return field;
   const entries = Array.isArray(field) ? field : [field];
   const byLang = e => (e && typeof e === 'object') ? String(e['@_lang']) : null;
-  const textOf = e => (e && typeof e === 'object') ? (e['#text'] ?? null) : (typeof e === 'string' ? e : null);
-  const preferred = entries.find(e => byLang(e) === String(preferredLang));
+  // CONFIRMED (Postman, Aug 2026): AB.pl can return a self-closing empty
+  // tag for a requested language it has no translation for, e.g.
+  // <value lang="3" /> alongside a real <value lang="1">...</value> —
+  // parses to { '@_lang': '3' } with no '#text' at all. Treat that as
+  // "not present" so we fall through to the next language, not blank.
+  const textOf = e => {
+    if (e == null) return null;
+    if (typeof e === 'string') return e.trim() !== '' ? e : null;
+    if (typeof e === 'object') {
+      const t = e['#text'];
+      return (t != null && String(t).trim() !== '') ? t : null;
+    }
+    return null;
+  };
+  const preferred = entries.find(e => byLang(e) === String(preferredLang) && textOf(e) != null);
   if (preferred) return textOf(preferred);
-  const fallback = entries.find(e => byLang(e) === String(fallbackLang));
+  const fallback = entries.find(e => byLang(e) === String(fallbackLang) && textOf(e) != null);
   if (fallback) return textOf(fallback);
   // Last resort: first entry with any text content at all.
   const any = entries.find(e => textOf(e) != null);
@@ -2322,6 +2335,23 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
       product.specs = product.specs || {};
       product.specs.ab_main_image_id = String(imageId);
       // No req=image call made here — see AB_PL_SETUP.md follow-up items.
+    }
+  }
+  if (!product.description) {
+    // CONFIRMED (Postman, Aug 2026): AB.pl's real description text does
+    // NOT come through raw.description/raw.desc (neither field exists in
+    // the actual response) — it lives nested inside paramsvalues2's
+    // paramvalue2 array, specifically the entry with prm=52 (per the
+    // docs: "value of product description parameter"), whose own
+    // <value> is itself lang-tagged the same way <name> is. Without this,
+    // product.description was silently null for every AB.pl product
+    // despite withdesc=1 being requested.
+    const pvals = raw.paramsvalues2?.paramvalue2;
+    const pvalList = Array.isArray(pvals) ? pvals : (pvals ? [pvals] : []);
+    const descParam = pvalList.find(pv => String(pv?.prm) === '52');
+    if (descParam) {
+      const descHtml = abExtractLocalized(descParam.value);
+      if (descHtml) product.description = descHtml;
     }
   }
   if (!product.description) {
