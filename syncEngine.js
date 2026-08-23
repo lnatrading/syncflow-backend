@@ -2544,6 +2544,25 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
     }
   }
 
+  // FINAL SAFETY NET (Aug 2026): the user-configurable Field Mappings
+  // loop at the top of this function (`for (const mapping of mappings)`)
+  // assigns product[internalKey] = rawValue DIRECTLY and unconditionally
+  // — if AB Poland's Field Mappings page has 'name' mapped to 'name'
+  // (or 'description' to 'description'), that assignment happens BEFORE
+  // any of the extraction logic above, and because the resulting object
+  // is truthy, every subsequent `if (!product.name)` guard silently
+  // skips — the exact reason names still showed as literal stringified
+  // objects in production even after every extraction fix above was
+  // deployed and confirmed live. This runs LAST, unconditionally, so no
+  // earlier code path (existing or future) can leave a lang-tagged
+  // object in a field that Supabase/Odoo expect to be plain text.
+  if (product.name && typeof product.name === 'object') {
+    product.name = abExtractLocalized(product.name) || 'Unknown';
+  }
+  if (product.description && typeof product.description === 'object') {
+    product.description = abExtractLocalized(product.description) || null;
+  }
+
   return product;
 }
 
