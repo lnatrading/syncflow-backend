@@ -248,6 +248,16 @@ async function upsertBatch(config, products) {
       // more attributes get mapped, no Odoo-side changes ever needed again.
       // Requires custom Text field x_specifications on product.template in Odoo.
       ...(product.specs_summary ? { x_specifications: sanitizeXmlText(product.specs_summary) } : {}),
+      // Brand/manufacturer — confirmed (Aug 2026, Odoo field list) that no
+      // Syncflow-specific brand field exists, but itscope_manufacturer
+      // (Char, product.template) already does — created for the separate
+      // ITscope module, but it's a plain stored text field with no
+      // ITscope-specific compute/write logic tied to it, and Syncflow vs
+      // ITscope products are entirely separate records (is_itscope_product
+      // true/false), so there's no write collision risk reusing it here
+      // rather than requesting a brand-new field from Solvti. Revisit if a
+      // dedicated field is ever added.
+      ...(product.brand ? { itscope_manufacturer: sanitizeXmlText(product.brand) } : {}),
     };
 
     // Prefer an exact SKU match (this is definitely "our" product from a
