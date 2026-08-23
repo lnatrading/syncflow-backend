@@ -2,6 +2,14 @@
 //  SyncFlow — syncEngine.js  (v3 — scale-ready)
 // ============================================================
 const axios       = require('axios');
+const { HttpsProxyAgent } = require('https-proxy-agent');
+
+// Optional forward proxy for AB.pl calls specifically (products/categories/
+// fast_update sync) — see the matching note in orderClients/ABClient.js for
+// the same setting on the order-placement side. Set AB_PROXY_URL to route
+// around Railway's rotating outbound IP; leave unset to call AB.pl directly.
+const AB_PROXY_URL = process.env.AB_PROXY_URL || null;
+const abProxyAgent = AB_PROXY_URL ? new HttpsProxyAgent(AB_PROXY_URL) : null;
 const { XMLParser } = require('fast-xml-parser');
 const { parse: csvParse } = require('csv-parse/sync');
 const odooClient  = require('./odooClient');
@@ -1297,6 +1305,7 @@ async function fetchEndpoint(urlTemplate, format, auth, templateValues = {}) {
         headers: { 'Content-Type': 'application/x-www-form-urlencoded', 'User-Agent': headers['User-Agent'] },
         timeout: 90000,
         responseType: 'text',
+        ...(abProxyAgent ? { httpsAgent: abProxyAgent, proxy: false } : {}),
       }),
       {
         maxAttempts: 3, baseDelayMs: 5000, multiplier: 3,
