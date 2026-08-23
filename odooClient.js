@@ -346,6 +346,19 @@ async function upsertBatch(config, products) {
             .map(f => `${f}=${JSON.stringify(String(values[f] ?? '').slice(0, 80))}`)
             .join(' | ');
           console.error(`[ODOO] write failed for id ${odoo_id}: ${e.message} — field preview: ${suspect}`);
+        } else if (/Barcode\(s\) already assigned/i.test(e.message || '')) {
+          // DIAGNOSTIC (Aug 2026): added after the "don't resend an
+          // unchanged barcode" fix above — this error is STILL occurring
+          // on some products even with that fix deployed, and we need to
+          // see whether `barcode` was actually included in THIS specific
+          // failing payload (the fix should have omitted it) or whether
+          // it was included with a value that didn't match what was
+          // already stored (meaning this is a genuine still-unresolved
+          // duplicate, which is expected/correct to fail) — can't tell
+          // which without this.
+          const sentBarcode = 'barcode' in values ? JSON.stringify(values.barcode) : '<omitted — fix worked, real duplicate>';
+          const storedBarcode = JSON.stringify(existingBarcodeById[odoo_id] ?? '<unknown — not in this batch\'s existing lookup>');
+          console.error(`[ODOO] write failed for id ${odoo_id}: ${e.message} — sent barcode: ${sentBarcode} | this record's stored barcode: ${storedBarcode}`);
         } else {
           console.error(`[ODOO] write failed for id ${odoo_id}:`, e.message);
         }
