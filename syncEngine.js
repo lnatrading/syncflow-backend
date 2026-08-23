@@ -193,9 +193,30 @@ async function runSupplierSyncInner(supabase, supplier) {
       console.log(`[SYNC] ${supplier.name} — ${resolvedCount} product(s) got a _resolvedCategory after merge`);
     }
 
+    // 3b. Fetch the manufacturers endpoint if present and merge into
+    // products (see mergeManufacturers() above — resolves producer_id to
+    // a real brand name instead of leaving it as a bare numeric ID).
+    // No-op until a 'manufacturers' endpoint is actually configured for a
+    // given supplier — safe to leave this in place for suppliers that
+    // don't have/need one.
+    const manufacturersEndpoint = endpoints.find(e => e.role === 'manufacturers');
+    if (manufacturersEndpoint) {
+      console.log(`[SYNC] ${supplier.name} — fetching manufacturers`);
+      const mfrUrl = versionResolver.resolveEndpointUrl(manufacturersEndpoint, activeVersion);
+      const rawManufacturers = await fetchEndpoint(mfrUrl, manufacturersEndpoint.format, auth)
+        .catch(e => { console.warn('[SYNC] Manufacturers fetch failed:', e.message); return []; });
+      console.log(`[SYNC] ${supplier.name} — fetched ${rawManufacturers.length} manufacturer record(s)`);
+      if (rawManufacturers.length) {
+        console.log(`[SYNC] ${supplier.name} — sample manufacturer:`, JSON.stringify(rawManufacturers[0]));
+      }
+      rawProducts = mergeManufacturers(rawProducts, rawManufacturers);
+      const resolvedMfrCount = rawProducts.filter(p => p._resolvedManufacturer).length;
+      console.log(`[SYNC] ${supplier.name} — ${resolvedMfrCount} product(s) got a _resolvedManufacturer after merge`);
+    }
+
     // 4. Fetch static (non-parameterised) secondary endpoints and merge
     const staticSecondary = endpoints.filter(e =>
-      !['products', 'categories'].includes(e.role) && !e.is_parameterised
+      !['products', 'categories', 'manufacturers'].includes(e.role) && !e.is_parameterised
     );
     for (const ep of staticSecondary) {
       // Per-endpoint frequency check:
@@ -1746,6 +1767,38 @@ function mergeCategories(products, categories) {
   });
 }
 
+// ── MERGE MANUFACTURERS (id -> name) INTO PRODUCTS ────────────────
+// Same pattern as mergeCategories() above. AB.pl's product feed only gives
+// a numeric producer_id per product — the actual manufacturer name comes
+// from a separate manufacturers/producers endpoint that must be fetched
+// and joined in. Before this existed, product.brand was set to the raw
+// numeric ID itself (e.g. "533") — never a real name — for every product,
+// which is why brand never showed anything meaningful anywhere downstream.
+function mergeManufacturers(products, manufacturers) {
+  if (!manufacturers.length) return products;
+
+  const nameById = {};
+  for (const m of manufacturers) {
+    const id = m.id || m.manufacturerId || m.producer_id;
+    if (id != null) {
+      // Confirmed (ab-pl-integration.md): manufacturer names can be blank
+      // on some real entries, and can carry stray leading/trailing
+      // whitespace baked into the source data — trim, and skip blanks
+      // rather than storing an empty string as if it were a real name.
+      const name = (typeof m.name === 'string' ? m.name : '').trim();
+      if (name) nameById[String(id)] = name;
+    }
+  }
+
+  return products.map(p => {
+    const rawProducerId = p.producer_id;
+    if (rawProducerId != null && nameById[String(rawProducerId)]) {
+      return { ...p, _resolvedManufacturer: nameById[String(rawProducerId)] };
+    }
+    return p;
+  });
+}
+
 // ── MERGE SECONDARY ENDPOINT DATA ───────────────────────────
 // For non-parameterised secondary feeds (stock, images, etc.),
 // try to match records by SKU / id and attach extra fields.
@@ -2403,7 +2456,17 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
     product.name = abExtractLocalized(raw.name) || product.name || 'Unknown';
   }
   if (!product.ean) product.ean = raw.ean || product.ean || null;
-  if (!product.brand && raw.producer_id) product.brand = String(raw.producer_id); // resolved to a real name via req=producers — see setup notes
+  if (!product.brand && raw._resolvedManufacturer) {
+    // FIXED (Aug 2026): was `String(raw.producer_id)` — the bare numeric
+    // ID (e.g. "533"), never a real name. mergeManufacturers() (see above,
+    // called from the main sync flow before this function runs) resolves
+    // it to the actual manufacturer name via a manufacturers endpoint —
+    // falls through to the raw ID only if that endpoint isn't configured
+    // or the lookup didn't find a match, so brand is never silently blank.
+    product.brand = raw._resolvedManufacturer;
+  } else if (!product.brand && raw.producer_id) {
+    product.brand = String(raw.producer_id); // fallback only — not a real name
+  }
   if (!product.cost_price || product.cost_price === 0) {
     product.cost_price = parseFloat(raw.price) || product.cost_price || 0;
   }
