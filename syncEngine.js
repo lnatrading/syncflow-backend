@@ -39,17 +39,19 @@ function abExtractLocalized(field, preferredLang = AB_LANG_EN, fallbackLang = AB
   if (field == null) return null;
   if (typeof field === 'string') return field;
   const entries = Array.isArray(field) ? field : [field];
-  const byLang = e => (e && typeof e === 'object') ? String(e['@_lang']) : null;
-  // CONFIRMED (Postman, Aug 2026): AB.pl can return a self-closing empty
-  // tag for a requested language it has no translation for, e.g.
-  // <value lang="3" /> alongside a real <value lang="1">...</value> —
-  // parses to { '@_lang': '3' } with no '#text' at all. Treat that as
-  // "not present" so we fall through to the next language, not blank.
+  const byLang = e => (e && typeof e === 'object') ? String(e['@_lang'] ?? e.lang) : null;
+  // CONFIRMED (production sync, Aug 2026): two different real shapes exist
+  // depending on which AB.pl structure this came from — product <name
+  // lang="3">text</name> parses via XML attributes ('@_lang'/'#text'),
+  // but req=groups' category locales come back as NESTED ELEMENTS
+  // instead: locales.locale = [{ lang: 1, value: '...' }, { lang: 3,
+  // value: '...' }] — plain 'lang'/'value' keys, no '@_' prefix, no
+  // '#text'. Check both key shapes.
   const textOf = e => {
     if (e == null) return null;
     if (typeof e === 'string') return e.trim() !== '' ? e : null;
     if (typeof e === 'object') {
-      const t = e['#text'];
+      const t = e['#text'] ?? e.value;
       return (t != null && String(t).trim() !== '') ? t : null;
     }
     return null;
@@ -1669,14 +1671,14 @@ function mergeCategories(products, categories) {
   for (const cat of categories) {
     const id = cat.id || cat.categoryId || cat.cat_id || cat.code;
     if (id != null) {
-      // Same multi-language shape as product names — req=groups can return
-      // a lang-tagged <name> (or a locales[] array, if that's the real
-      // shape once live-tested) once langs=1;3 is requested. Fall through
-      // to the plain title/label/id fields for suppliers without this.
-      let localizedName = abExtractLocalized(cat.name) || abExtractLocalized(cat.locales);
-      // The generic HTML-strip in fetchEndpoint's xml_post_abpl branch
-      // only fires when cat.name is a plain string — it never sees a
-      // lang-tagged object/array shape, so strip again here for that case.
+      // CONFIRMED (production sync, Aug 2026) real shape: cat.name is a
+      // flat, non-localized string (e.g. "3D" — same in every language
+      // for many categories); the actual per-language values live in
+      // cat.locales.locale, an array of { lang: 1|3, value: '...' } —
+      // NOT a lang-tagged cat.name itself. Extract from locales.locale
+      // first; fall back to the flat cat.name only if that's absent.
+      const localeEntries = cat.locales?.locale;
+      let localizedName = localeEntries ? abExtractLocalized(localeEntries) : null;
       if (typeof localizedName === 'string' && localizedName.includes('<')) {
         localizedName = localizedName.replace(/<[^>]*>/g, '').trim();
       }
@@ -2144,8 +2146,21 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
   // Note: XML parsed with attributeNamePrefix '@_', so TD Baltic fields come as @_TDPartNbr etc.
   if (!product.sku)        product.sku        = raw.SKU || raw.sku || raw.ref || raw.code || raw.id || raw.elkoCode
                                                || raw['@_TDPartNbr'] || raw.TDPartNbr || '';
-  if (!product.name)       product.name       = raw.name || raw.title || raw.product_name
-                                               || raw['@_ProdDesc'] || raw.ProdDesc || 'Unknown';
+  if (!product.name) {
+    // GUARD: raw.name can be a lang-tagged object/array (AB.pl: { '@_lang':
+    // '3', '#text': '...' } or an array of those) rather than a plain
+    // string. Blindly assigning it here (as this line used to) stored the
+    // literal object — JSON.stringify'd downstream into names like
+    // {"#text":"...","@_lang":"1"} in Odoo/the UI, for EVERY AB.pl
+    // product, because setting product.name here also short-circuited the
+    // later AB.pl-specific extraction block (its own `if (!product.name)`
+    // guard was already false by the time it ran). abExtractLocalized()
+    // safely passes plain strings through unchanged, so this is safe for
+    // every other supplier's flat-string raw.name too.
+    product.name = abExtractLocalized(raw.name) || (typeof raw.title === 'string' ? raw.title : null)
+                 || (typeof raw.product_name === 'string' ? raw.product_name : null)
+                 || raw['@_ProdDesc'] || raw.ProdDesc || 'Unknown';
+  }
   if (!product.cost_price) product.cost_price = parseFloat(raw.cost || raw.cost_price || raw.wholesale_price
                                                || raw['@_Price'] || raw.Price || 0);
   if (!product.sale_price) product.sale_price = parseFloat(raw.price || raw.sale_price || raw.list_price
@@ -2293,11 +2308,10 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
   // groups>group>id (nested, not a flat array).
   if (!product.sku) product.sku = raw.abpn || product.sku || '';
   if (!product.name) {
-    // langs request param must include BOTH codes (e.g. langs=1;3) for
-    // English to appear at all — AB.pl adds an extra tagged <name> per
-    // requested language rather than swapping which one comes back.
-    // abExtractLocalized() picks English (lang=3), falling back to
-    // Polish (lang=1) if English wasn't returned for this product.
+    // Dead-path safety net in practice — the generic fallback earlier in
+    // this function (search abExtractLocalized(raw.name) above) now
+    // handles this correctly and always sets product.name first. Kept
+    // here only in case that ordering ever changes again.
     product.name = abExtractLocalized(raw.name) || product.name || 'Unknown';
   }
   if (!product.ean) product.ean = raw.ean || product.ean || null;
