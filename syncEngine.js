@@ -10,6 +10,7 @@ const { HttpsProxyAgent } = require('https-proxy-agent');
 // around Railway's rotating outbound IP; leave unset to call AB.pl directly.
 const AB_PROXY_URL = process.env.AB_PROXY_URL || null;
 const abProxyAgent = AB_PROXY_URL ? new HttpsProxyAgent(AB_PROXY_URL) : null;
+console.log(`[SYNC] AB_PROXY_URL is ${AB_PROXY_URL ? 'SET (host: ' + (AB_PROXY_URL.split('@')[1] || 'unknown') + ')' : 'NOT SET'}`);
 const { XMLParser } = require('fast-xml-parser');
 const { parse: csvParse } = require('csv-parse/sync');
 const odooClient  = require('./odooClient');
