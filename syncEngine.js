@@ -164,6 +164,17 @@ async function runSupplierSyncInner(supabase, supplier) {
     // Apply field renames from active API version
     rawProducts = versionResolver.transformProducts(rawProducts, activeVersion);
 
+    // Live PLN->EUR rate for AB.pl (see fetchAbEurRate above) — fetched once
+    // per sync, attached to every raw record so normaliseProduct can use it
+    // instead of the static fallback rate.
+    if (productsEndpoint.format === 'xml_post_abpl') {
+      const liveRate = await fetchAbEurRate(auth);
+      if (liveRate) {
+        console.log(`[AB.pl] live PLN->EUR rate: ${liveRate} (1 EUR = ${liveRate} PLN)`);
+        for (const p of rawProducts) p.__abEurRate = liveRate;
+      }
+    }
+
     // 3. Fetch the categories endpoint if present and merge into products
     const categoriesEndpoint = endpoints.find(e => e.role === 'categories');
     if (categoriesEndpoint) {
@@ -1258,6 +1269,35 @@ async function runFastUpdate(supabase, supplier, endpoint, auth, jobId, activeVe
 }
 
 // ── FETCH A SINGLE ENDPOINT ──────────────────────────────────
+// CONFIRMED (AB.pl docs, Aug 2026): AB.pl exposes a live currency-exchange
+// endpoint — req=exchange_curr_rate&curr=EUR — returning <rate>4.225</rate>
+// meaning "1 EUR = 4.225 PLN" (i.e. divide a PLN amount by this rate to get
+// EUR). Fetched ONCE per AB.pl sync run (not per-product) and threaded
+// through normaliseProduct via a raw.__abEurRate field, so a live rate is
+// used whenever available, falling back to the static approximation in
+// normaliseProduct if this fetch fails for any reason.
+async function fetchAbEurRate(auth) {
+  try {
+    const body = new URLSearchParams({
+      req: 'exchange_curr_rate', curr: 'EUR',
+      client: auth?.extra?.client || '', login: auth?.username || '', pass: auth?.password || '',
+    });
+    const resp = await axios.post('https://xml.ab.pl/gateway.php', body.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      httpsAgent: abProxyAgent || undefined, timeout: 15000,
+    });
+    const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
+    const parsed = parser.parse(resp.data);
+    const rate = parseFloat(parsed?.gateway?.['exchange-rate']?.rate);
+    if (Number.isFinite(rate) && rate > 0) return rate;
+    console.warn('[AB.pl] exchange_curr_rate returned no usable rate — falling back to static approximation');
+    return null;
+  } catch (e) {
+    console.warn('[AB.pl] exchange_curr_rate fetch failed — falling back to static approximation:', e.message);
+    return null;
+  }
+}
+
 async function fetchEndpoint(urlTemplate, format, auth, templateValues = {}) {
   // Substitute any {placeholder} tokens in the URL (parameterised endpoints)
   let url = urlTemplate.replace(/\{(\w+)\}/g, (_, key) =>
@@ -1416,7 +1456,17 @@ async function fetchEndpoint(urlTemplate, format, auth, templateValues = {}) {
     // rather than assuming an exact nesting path (see VERIFY note above).
     const arr = findFirst(parsed, n => Array.isArray(n) && n.length > 0 &&
       typeof n[0] === 'object' && ('id' in n[0] || 'abpn' in n[0] || 'parentid' in n[0]));
-    if (!arr) return [];
+    if (!arr) {
+      // DIAGNOSTIC (Aug 2026): this used to silently return [] here,
+      // indistinguishable from a genuinely-empty-but-successful AB.pl
+      // response. If req= isn't a real/valid AB.pl request type, or the
+      // response shape doesn't match anything the two error-node checks
+      // above catch, this is where it would have vanished with zero
+      // trace. Log a preview so a bad req value or unrecognized error
+      // shape is diagnosable from the first occurrence, not a guess.
+      console.warn(`[AB.pl] ${reqName}: no recognizable item array in response — raw preview: ${String(response.data).slice(0, 300)}`);
+      return [];
+    }
 
     // CONFIRMED (Postman, Aug 2026): req=groups is a FLAT parentid-linked
     // list (id, parentid, name, has_filters, special, locales[]) — root
@@ -2139,6 +2189,43 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
     if (rawValue !== undefined) {
       const internalKey = internalKeyMap[mapping.odoo_field] || mapping.odoo_field;
       product[internalKey] = rawValue;
+    }
+  }
+
+  // CURRENCY CONVERSION (Aug 2026): confirmed real bug — AB.pl quotes every
+  // price in PLN (raw.currency = "PLN", confirmed via live Postman testing
+  // and production sample data), but cost_price/sale_price were being
+  // written straight through with NO conversion, so a 100 PLN item (≈ €23)
+  // was stored and displayed as €100 — a ~4.3x overpricing on every single
+  // AB.pl product. DCS/Mediamax/TD Baltic feeds either omit a currency
+  // field entirely or already report "EUR" (TD Baltic confirmed: raw
+  // sample shows "Currency":"EUR"), so this is a no-op for them — only
+  // fires for a recognized NON-EUR currency.
+  //
+  // Rate is a static approximation, NOT a live feed — accuracy drifts over
+  // time and needs periodic manual updates (env var override available).
+  // A live FX API would be more accurate long-term but adds an external
+  // dependency/failure point to every sync; flagged as a possible future
+  // improvement, not implemented here.
+  const CURRENCY_TO_EUR_RATE = {
+    PLN: parseFloat(process.env.PLN_TO_EUR_RATE) || 0.234, // ~4.27 PLN/EUR, Aug 2026 approx — used only if the live rate fetch fails
+  };
+  const rawCurrency = (raw.currency || raw.Currency || '').toUpperCase();
+  if (rawCurrency && rawCurrency !== 'EUR') {
+    // Prefer AB.pl's own live rate (raw.__abEurRate = "1 EUR = X PLN",
+    // attached once per sync above) over the static approximation.
+    const rate = (rawCurrency === 'PLN' && raw.__abEurRate)
+      ? (1 / raw.__abEurRate)
+      : CURRENCY_TO_EUR_RATE[rawCurrency];
+    if (rate) {
+      if (typeof product.cost_price === 'number' || typeof product.cost_price === 'string') {
+        const n = parseFloat(product.cost_price);
+        if (Number.isFinite(n)) product.cost_price = parseFloat((n * rate).toFixed(2));
+      }
+      if (typeof product.sale_price === 'number' || typeof product.sale_price === 'string') {
+        const n = parseFloat(product.sale_price);
+        if (Number.isFinite(n)) product.sale_price = parseFloat((n * rate).toFixed(2));
+      }
     }
   }
 
