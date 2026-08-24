@@ -33,8 +33,18 @@ const { withRetry, sleep } = require('./retry');
 // fallback tag actually exists in the response for this to have anything
 // to select between. With only langs=3 requested, whatever AB.pl returns
 // (real English, or a mislabeled/duplicated default) is all there is.
-const AB_LANG_EN = '3';
-const AB_LANG_PL = '1';
+// CONFIRMED (AB.pl support reply, Aug 2026): AB.pl explicitly warned against
+// hardcoding lang="3" for English — language IDs can differ between
+// accounts. The reliable way is req=langs2 (client credentials only),
+// looking up the entry whose name matches "English"/"Polski". These two
+// are `let`, not `const`, specifically so fetchAbLanguageIds() (below) can
+// overwrite them once per AB.pl sync with the account's real IDs — they
+// start as the values already empirically confirmed correct for THIS
+// account via live product testing, and serve as the fallback if that
+// lookup ever fails (network hiccup, endpoint error, etc.), never as an
+// assumption we rely on going forward.
+let AB_LANG_EN = '3';
+let AB_LANG_PL = '1';
 function abExtractLocalized(field, preferredLang = AB_LANG_EN, fallbackLang = AB_LANG_PL) {
   if (field == null) return null;
   if (typeof field === 'string') return field;
@@ -151,7 +161,32 @@ async function runSupplierSyncInner(supabase, supplier) {
     // 2. Fetch the products endpoint (always required, role = 'products')
 
     // Apply version endpoint override if present
-    const productsUrl = versionResolver.resolveEndpointUrl(productsEndpoint, activeVersion);
+    let productsUrl = versionResolver.resolveEndpointUrl(productsEndpoint, activeVersion);
+
+    // Live language IDs for AB.pl (see fetchAbLanguageIds above) — per
+    // AB.pl support's own advice, never hardcode lang="3" for English.
+    // MUST run before the products fetch, not after: the stored endpoint
+    // URL has a static langs=1;3 baked in from when it was configured —
+    // if the account's IDs ever changed, that static value would still
+    // REQUEST the old (wrong) languages, even though the parsing side
+    // below would then correctly look for whatever the new IDs mean.
+    // Fixing extraction without fixing the request would be incomplete —
+    // rewrite the actual outgoing request here so both sides agree.
+    if (productsEndpoint.format === 'xml_post_abpl') {
+      const liveLangIds = await fetchAbLanguageIds(auth);
+      if (liveLangIds) {
+        console.log(`[AB.pl] live language IDs: English=${liveLangIds.en}, Polski=${liveLangIds.pl}`);
+        AB_LANG_EN = liveLangIds.en;
+        AB_LANG_PL = liveLangIds.pl;
+        const correctedLangs = `${AB_LANG_PL};${AB_LANG_EN}`;
+        if (/([?&])langs=[^&]*/.test(productsUrl)) {
+          productsUrl = productsUrl.replace(/([?&])langs=[^&]*/, `$1langs=${correctedLangs}`);
+        } else {
+          productsUrl += (productsUrl.includes('?') ? '&' : '?') + `langs=${correctedLangs}`;
+        }
+      }
+    }
+
     console.log(`[SYNC] ${supplier.name} — fetching products: ${productsUrl}`);
     let rawProducts = await fetchEndpoint(productsUrl, productsEndpoint.format, auth);
     console.log(`[SYNC] ${supplier.name} — parsed ${rawProducts.length} product record(s)`);
@@ -1288,6 +1323,48 @@ async function runFastUpdate(supabase, supplier, endpoint, auth, jobId, activeVe
     detail:      `${updated} stock/price refreshes in ${elapsedSec}s${unknownSkus ? ` | ${unknownSkus} unknown SKUs (await full sync)` : ''}${odooBatchErrors ? ` | ${odooBatchErrors} Odoo batch errors` : ''}`,
     supplier_id: supplier.id,
   });
+}
+
+// CONFIRMED (AB.pl support reply, Aug 2026): req=langs2 (client credentials
+// only) returns every configured language for the account, each with
+// <id>/<name>/<sysname>/<active>. Fetched once per AB.pl sync, matched by
+// name against "English"/"Polski" (case-insensitive, matches either <name>
+// or <sysname> since some accounts may localize one but not the other),
+// and used to overwrite the module-level AB_LANG_EN/AB_LANG_PL for the
+// rest of that sync run. Returns null (no-op — existing values untouched)
+// if the fetch fails or either language isn't found, exactly like
+// fetchAbEurRate's fallback pattern above.
+async function fetchAbLanguageIds(auth) {
+  try {
+    const body = new URLSearchParams({
+      req: 'langs2',
+      client: auth?.extra?.client || '', login: auth?.username || '', pass: auth?.password || '',
+    });
+    const resp = await axios.post('https://xml.ab.pl/gateway.php', body.toString(), {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      httpsAgent: abProxyAgent || undefined, timeout: 15000,
+    });
+    const parser = new XMLParser({ ignoreAttributes: false, attributeNamePrefix: '@_' });
+    const parsed = parser.parse(resp.data);
+    const list = parsed?.gateway?.languages?.language;
+    const languages = Array.isArray(list) ? list : (list ? [list] : []);
+    const findByName = target => {
+      const match = languages.find(l => {
+        const name = String(l?.name ?? '').trim().toLowerCase();
+        const sysname = String(l?.sysname ?? '').trim().toLowerCase();
+        return name === target || sysname === target;
+      });
+      return match ? String(match.id) : null;
+    };
+    const en = findByName('english');
+    const pl = findByName('polski');
+    if (en && pl) return { en, pl };
+    console.warn(`[AB.pl] langs2 response missing English or Polski entry — keeping current lang IDs (en=${AB_LANG_EN}, pl=${AB_LANG_PL})`);
+    return null;
+  } catch (e) {
+    console.warn('[AB.pl] langs2 fetch failed — keeping current lang IDs:', e.message);
+    return null;
+  }
 }
 
 // ── FETCH A SINGLE ENDPOINT ──────────────────────────────────

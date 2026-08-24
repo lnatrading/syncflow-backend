@@ -309,14 +309,45 @@ async function upsertBatch(config, products) {
   }
 
   if (toCreate.length) {
-    const newIds = await call(object, 'execute_kw', [
-      config.database, uid, config.api_key,
-      'product.template', 'create',
-      [toCreate]
-    ]);
-    // Odoo's create() returns new IDs in the same order as the input list —
-    // zip them back to the SKUs that were just created.
-    newIds.forEach((id, i) => { skuToOdooId[toCreate[i].default_code] = id; });
+    try {
+      const newIds = await call(object, 'execute_kw', [
+        config.database, uid, config.api_key,
+        'product.template', 'create',
+        [toCreate]
+      ]);
+      // Odoo's create() returns new IDs in the same order as the input list —
+      // zip them back to the SKUs that were just created.
+      newIds.forEach((id, i) => { skuToOdooId[toCreate[i].default_code] = id; });
+    } catch (bulkErr) {
+      // FIX (Aug 2026): this bulk create() previously had NO error handling
+      // at all. Odoo's create([...]) with multiple records runs as ONE
+      // transaction — a single barcode collision (or any other constraint
+      // violation) among brand-new products throws for the WHOLE batch,
+      // silently discarding every other legitimately-new product in it,
+      // with none of the diagnostic logging the update path already has.
+      // Fall back to creating one at a time so a single bad record can't
+      // block the rest, with the same concurrency pattern and barcode
+      // diagnostics used for updates below.
+      console.warn(`[ODOO] Bulk create failed for ${toCreate.length} new product(s), falling back to one-at-a-time: ${bulkErr.message}`);
+      const CREATE_CONCURRENCY = 15;
+      for (let i = 0; i < toCreate.length; i += CREATE_CONCURRENCY) {
+        const window = toCreate.slice(i, i + CREATE_CONCURRENCY);
+        await Promise.all(window.map(values =>
+          call(object, 'execute_kw', [
+            config.database, uid, config.api_key,
+            'product.template', 'create',
+            [[values]]
+          ]).then(([newId]) => { skuToOdooId[values.default_code] = newId; })
+            .catch(e => {
+              if (/Barcode\(s\) already assigned/i.test(e.message || '')) {
+                console.error(`[ODOO] create failed for sku ${values.default_code}: ${e.message} — attempted barcode: ${JSON.stringify(values.barcode)}`);
+              } else {
+                console.error(`[ODOO] create failed for sku ${values.default_code}:`, e.message);
+              }
+            })
+        ));
+      }
+    }
   }
 
   // ── Step 3: Update existing products ────────────────────────────────────
