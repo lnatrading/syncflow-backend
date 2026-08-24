@@ -206,6 +206,11 @@ async function upsertBatch(config, products) {
 
   const toCreate = [];
   const toUpdate = []; // [{ odoo_id, values }]
+  // Tracks the redirect target for the cross-record collision case above —
+  // applied to skuToOdooId AFTER it's built from toUpdate, so it correctly
+  // overrides the (wrong) skuMatchId-based mapping. See
+  // crossRecordBarcodeCollision below for why this redirect exists.
+  const crossRecordRedirects = {};
 
   // ── ODOO 17+ SCHEMA CHANGE ────────────────────────────────────
   // Odoo <17: product.template.type accepted 'product' (storable),
@@ -269,6 +274,25 @@ async function upsertBatch(config, products) {
     const matchedId      = skuMatchId || barcodeMatchId;
     const matchedViaBarcodeOnly = !skuMatchId && !!barcodeMatchId;
 
+    // REAL FIX (Aug 24 2026), not a cleanup task: this is why barcode
+    // collisions like the Ryzen 5600G / Oral-B pairs kept failing on
+    // EVERY sync forever, never resolving on their own. This supplier
+    // already has ITS OWN separate product.template record (skuMatchId,
+    // matched by SKU from an earlier sync) — but its own barcode/EAN
+    // already legitimately belongs to a DIFFERENT existing record
+    // (barcodeMatchId, e.g. one DCS created). SKU-match always won
+    // before, so every sync kept trying to write that barcode onto
+    // skuMatchId's record and failing — the SAME doomed write, forever,
+    // because nothing ever changed which record was being targeted.
+    // Two records sharing a real-world EAN this way IS the signal they're
+    // the same product — exactly the case that already works correctly
+    // when SKU is unrecognised (matchedViaBarcodeOnly above, e.g. the
+    // WiFi Adapter: DCS creates it, AB's barcode-only match finds and
+    // adds a second vendor line to the SAME record, no collision at
+    // all). This just extends that same successful pattern to the case
+    // where a stale/redundant SKU-matched record also happens to exist.
+    const crossRecordBarcodeCollision = skuMatchId && barcodeMatchId && skuMatchId !== barcodeMatchId;
+
     if (matchedViaBarcodeOnly) {
       // Don't touch default_code here — overwriting the other system's own
       // SKU/reference on their product could break their ability to find
@@ -295,6 +319,20 @@ async function upsertBatch(config, products) {
       delete values.barcode;
     }
 
+    // Cross-record collision: never attempt this write at all — it would
+    // always fail, and skuMatchId's record isn't where this supplier's
+    // data belongs anyway (see crossRecordBarcodeCollision above). Drop
+    // the doomed barcode field so the rest of this record's fields
+    // (name/price/stock/etc.) can still update cleanly without erroring.
+    if (crossRecordBarcodeCollision) {
+      delete values.barcode;
+      // Redirect this supplier's vendor/pricing line to the record that
+      // actually owns the barcode, not the stale SKU-matched one — same
+      // successful pattern as matchedViaBarcodeOnly (the WiFi Adapter
+      // case) above, just reached from the other direction.
+      crossRecordRedirects[product.sku] = barcodeMatchId;
+    }
+
     if (matchedId) {
       toUpdate.push({ odoo_id: matchedId, values, sku: product.sku });
     } else {
@@ -307,6 +345,9 @@ async function upsertBatch(config, products) {
   for (const { odoo_id, sku } of toUpdate) {
     skuToOdooId[sku] = odoo_id;
   }
+  // Apply cross-record redirects AFTER the above — must override, not be
+  // overridden by, the (wrong) skuMatchId-based mapping for these SKUs.
+  Object.assign(skuToOdooId, crossRecordRedirects);
 
   if (toCreate.length) {
     try {
