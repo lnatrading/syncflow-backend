@@ -256,13 +256,22 @@ async function upsertBatch(config, products) {
       // Brand/manufacturer — confirmed (Aug 2026, Odoo field list) that no
       // Syncflow-specific brand field exists, but itscope_manufacturer
       // (Char, product.template) already does — created for the separate
-      // ITscope module, but it's a plain stored text field with no
-      // ITscope-specific compute/write logic tied to it, and Syncflow vs
-      // ITscope products are entirely separate records (is_itscope_product
-      // true/false), so there's no write collision risk reusing it here
-      // rather than requesting a brand-new field from Solvti. Revisit if a
-      // dedicated field is ever added.
-      ...(product.brand ? { itscope_manufacturer: sanitizeXmlText(product.brand) } : {}),
+      // ITscope module.
+      // CORRECTION (Aug 24 2026): the original assumption here — "Syncflow
+      // vs ITscope products are entirely separate records, no collision
+      // risk" — was WRONG. Barcode-matching (matchedViaBarcodeOnly /
+      // crossRecordBarcodeCollision above) can and does match a Syncflow
+      // product onto a record ITscope actually created, exactly like it
+      // correctly merges two Syncflow suppliers onto one record. That's
+      // fine for price/stock — but it means a bare numeric FALLBACK brand
+      // value (e.g. AB.pl's raw producer_id, used when that producer's
+      // real name is blank upstream) could silently overwrite ITscope's
+      // own correctly-resolved manufacturer name with a meaningless
+      // number like "4320". Guard against writing anything that's purely
+      // numeric — a real brand name is never just digits — so only
+      // genuinely-resolved names ever reach this shared field.
+      ...(product.brand && !/^\d+$/.test(String(product.brand).trim())
+        ? { itscope_manufacturer: sanitizeXmlText(product.brand) } : {}),
     };
 
     // Prefer an exact SKU match (this is definitely "our" product from a
@@ -401,12 +410,59 @@ async function upsertBatch(config, products) {
   const WRITE_CONCURRENCY = 15;
   for (let i = 0; i < toUpdate.length; i += WRITE_CONCURRENCY) {
     const window = toUpdate.slice(i, i + WRITE_CONCURRENCY);
-    await Promise.all(window.map(({ odoo_id, values }) =>
+    await Promise.all(window.map(({ odoo_id, values, sku }) =>
       call(object, 'execute_kw', [
         config.database, uid, config.api_key,
         'product.template', 'write',
         [[odoo_id], values]
-      ]).catch(e => {
+      ]).catch(async e => {
+        // RECOVERY (Aug 24 2026): rather than pattern-match error text to
+        // guess whether this specific failure means "record vanished
+        // mid-sync" (we don't know the exact wording Odoo's XML-RPC layer
+        // produces for that case — possibly this exact "Invalid XML-RPC
+        // message" if the underlying MissingError doesn't serialize
+        // cleanly as a proper fault), check ground truth directly instead:
+        // does this id still exist at all? search_read safely returns an
+        // empty list for a missing id rather than throwing (unlike
+        // read/write, which raise MissingError on a nonexistent id).
+        //
+        // Confirmed (chat, Aug 24 2026): Syncflow itself never
+        // deletes/archives product.template records — grepped the whole
+        // codebase, zero unlink/archive calls on Odoo products. So a
+        // genuinely-vanished record means something EXTERNAL removed it
+        // between when this sync's search_read found it and when this
+        // write executed moments later — ITscope's own module is the
+        // leading suspect, given the affected products' pattern (Polish
+        // names, numeric SKUs) doesn't match any Syncflow supplier.
+        //
+        // If it's really gone, recreate it fresh instead of logging the
+        // same opaque error every single sync forever — self-healing,
+        // same philosophy as the barcode-collision fix above.
+        let recovered = false;
+        try {
+          const stillExists = await call(object, 'execute_kw', [
+            config.database, uid, config.api_key,
+            'product.template', 'search_read',
+            [[['id', '=', odoo_id]]],
+            { fields: ['id'] }
+          ]);
+          if (stillExists.length === 0) {
+            console.warn(`[ODOO] id ${odoo_id} (sku ${sku}) no longer exists in Odoo — recreating as a new product.`);
+            const recreateValues = { ...values, default_code: sku };
+            const [newId] = await call(object, 'execute_kw', [
+              config.database, uid, config.api_key,
+              'product.template', 'create',
+              [[recreateValues]]
+            ]);
+            skuToOdooId[sku] = newId; // overwrite the stale pre-write mapping
+            console.log(`[ODOO] Recreated sku ${sku} as new id ${newId}.`);
+            recovered = true;
+          }
+        } catch (checkErr) {
+          console.error(`[ODOO] Existence check / recreate failed for id ${odoo_id} (sku ${sku}):`, checkErr.message);
+        }
+        if (recovered) return;
+
         // DIAGNOSTIC (Aug 2026): "Invalid XML-RPC message" gives no
         // indication of which field/character caused it — recurring
         // despite sanitizeXmlText already handling known bad-char
@@ -414,17 +470,21 @@ async function upsertBatch(config, products) {
         // Log enough of the actual payload to spot the next bad pattern
         // immediately instead of guessing blind from the bare error.
         if (/Invalid XML-RPC message/i.test(e.message || '')) {
-          // WIDENED (Aug 24 2026): previously only checked 4 fields. Two
-          // failures today (SKU MDMX12027600, MDMX12027638) showed nothing
-          // suspicious in any of those 4 — meaning the actual bad field is
-          // very likely one NOT previewed before: this same sync run was
-          // the first time itscope_manufacturer (brand) and barcode got
-          // sent for AB Poland products at full-catalogue scale, so either
-          // is a real candidate for a not-yet-seen bad-character pattern.
+          // WIDENED (Aug 24 2026, second pass): the string-field preview
+          // showed nothing suspicious across ~40 failures spanning wildly
+          // different products/suppliers/languages — no bad Unicode, no
+          // obviously malformed text anywhere. That points away from text
+          // content entirely and toward a NUMERIC field carrying something
+          // XML-RPC can't serialize (NaN, Infinity, a stray string where a
+          // number's expected, etc.) — none of which the string-only
+          // preview would ever have caught. Adding the numeric fields too.
           const suspect = ['name', 'description_sale', 'x_specifications', 'default_code', 'itscope_manufacturer', 'barcode', 'x_image_url']
             .map(f => `${f}=${JSON.stringify(String(values[f] ?? '').slice(0, 80))}`)
             .join(' | ');
-          console.error(`[ODOO] write failed for id ${odoo_id}: ${e.message} — field preview: ${suspect}`);
+          const numericPreview = ['list_price', 'standard_price', 'x_supplier_qty', 'categ_id']
+            .map(f => `${f}=${JSON.stringify(values[f])}`)
+            .join(' | ');
+          console.error(`[ODOO] write failed for id ${odoo_id}: ${e.message} — field preview: ${suspect} — numeric preview: ${numericPreview}`);
         } else if (/Barcode\(s\) already assigned/i.test(e.message || '')) {
           // DIAGNOSTIC (Aug 2026): added after the "don't resend an
           // unchanged barcode" fix above — this error is STILL occurring
