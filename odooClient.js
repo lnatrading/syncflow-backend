@@ -414,7 +414,14 @@ async function upsertBatch(config, products) {
         // Log enough of the actual payload to spot the next bad pattern
         // immediately instead of guessing blind from the bare error.
         if (/Invalid XML-RPC message/i.test(e.message || '')) {
-          const suspect = ['name', 'description_sale', 'x_specifications', 'default_code']
+          // WIDENED (Aug 24 2026): previously only checked 4 fields. Two
+          // failures today (SKU MDMX12027600, MDMX12027638) showed nothing
+          // suspicious in any of those 4 — meaning the actual bad field is
+          // very likely one NOT previewed before: this same sync run was
+          // the first time itscope_manufacturer (brand) and barcode got
+          // sent for AB Poland products at full-catalogue scale, so either
+          // is a real candidate for a not-yet-seen bad-character pattern.
+          const suspect = ['name', 'description_sale', 'x_specifications', 'default_code', 'itscope_manufacturer', 'barcode', 'x_image_url']
             .map(f => `${f}=${JSON.stringify(String(values[f] ?? '').slice(0, 80))}`)
             .join(' | ');
           console.error(`[ODOO] write failed for id ${odoo_id}: ${e.message} — field preview: ${suspect}`);
