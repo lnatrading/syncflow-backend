@@ -226,10 +226,12 @@ async function upsertBatch(config, products) {
 
   for (const product of products) {
     const values = {
+      name:             sanitizeXmlText(product.name) || 'Unknown',
       default_code:     sanitizeXmlText(product.sku),
       barcode:          sanitizeXmlText(product.ean) || false,
       list_price:       safeNumber(product.sale_price, 0),
       standard_price:   safeNumber(product.cost_price, 0),
+      description_sale: sanitizeXmlText(product.description) || '',
       ...typeFields,
       // Native Odoo product category (product.category, hierarchical) —
       // resolved once per unique "My Category" path via
