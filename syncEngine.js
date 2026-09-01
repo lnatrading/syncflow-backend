@@ -523,6 +523,19 @@ async function runSupplierSyncInner(supabase, supplier) {
           const path = p.subcategory ? `${p.category} > ${p.subcategory}` : p.category;
           catCounts[path] = (catCounts[path] || 0) + 1;
         }
+        // FIX (Sep 2026): if NO product in this run resolved a category at
+        // all, catCounts is empty — almost always because the categories
+        // fetch failed this run (network hiccup, rate limit, endpoint
+        // down), not because the supplier genuinely has zero categorized
+        // products. Previously this still proceeded to write
+        // `catCounts[cat.path] || 0` for every existing category, silently
+        // zeroing out real counts from the last successful run. A failed
+        // fetch should leave existing counts untouched, not erase them —
+        // skip the whole update in that case and let the next successful
+        // sync correct things.
+        if (Object.keys(catCounts).length === 0) {
+          console.warn(`[SYNC] ${supplier.name} — no products resolved a category this run, skipping category count update (leaving existing counts untouched)`);
+        } else {
         const { data: existingCats } = await supabase.from('supplier_categories')
           .select('id, path, name').eq('supplier_id', supplier.id);
         if (existingCats && existingCats.length > 0) {
@@ -564,6 +577,7 @@ async function runSupplierSyncInner(supabase, supplier) {
             }).catch(e => console.warn(`[SYNC] Category count chunk @${i} failed after retries:`, e.message));
           }
           console.log(`[SYNC] Category counts updated: ${updated}/${existingCats.length} with product counts`);
+        }
         }
       } catch(e) { console.warn('[SYNC] Category count update failed:', e.message); }
     }
