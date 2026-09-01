@@ -343,7 +343,16 @@ async function upsertBatch(config, products) {
     if (matchedId) {
       toUpdate.push({ odoo_id: matchedId, values, sku: product.sku });
     } else {
-      toCreate.push(values);
+      // FIX (Sep 2026): `name` is intentionally absent from `values` above —
+      // that protects Icecat-enriched names on UPDATES from being clobbered.
+      // But `name` is a mandatory field on product.template in Odoo, and a
+      // brand-new record has no existing enrichment to protect yet. Omitting
+      // it here made every create() fail outright ("Missing required value
+      // for the field 'Name'"). Set it only on this branch, from the same
+      // normalized product.name syncEngine.js already resolves upstream
+      // (with its own 'Unknown' fallback), so creates succeed without
+      // reopening the update-side overwrite problem this was fixed for.
+      toCreate.push({ ...values, name: sanitizeXmlText(product.name) || product.sku });
     }
   }
 
@@ -446,7 +455,15 @@ async function upsertBatch(config, products) {
           ]);
           if (stillExists.length === 0) {
             console.warn(`[ODOO] id ${odoo_id} (sku ${sku}) no longer exists in Odoo — recreating as a new product.`);
-            const recreateValues = { ...values, default_code: sku };
+            // Same mandatory-field issue as the main create() path above —
+            // `values` here never carries `name`. This recovery path only
+            // has `sku` in scope (not the original `product` object), so
+            // fall back to the SKU as a placeholder name. Acceptable here:
+            // this is a rare self-healing branch, not the normal creation
+            // path, and Icecat will still find/enrich this record on its
+            // next pass via default_code/barcode regardless of what the
+            // initial name is.
+            const recreateValues = { ...values, default_code: sku, name: sku };
             const [newId] = await call(object, 'execute_kw', [
               config.database, uid, config.api_key,
               'product.template', 'create',
