@@ -105,6 +105,52 @@ function sanitizeXmlText(str) {
   return s;
 }
 
+// DIAGNOSTIC (Sep 2026): "Invalid XML-RPC message" write failures are still
+// recurring (DCS, live) despite sanitizeXmlText already handling every known
+// bad-char class. Two real gaps in how we've been diagnosing this so far:
+// (1) the failure-log preview truncates every field to 80 chars, so a bad
+// character sitting deeper into a long field (x_specifications especially)
+// would never actually appear in what we've been looking at; (2) we've only
+// ever inspected a fixed shortlist of 7 fields, never the full `values`
+// payload, so a bad character in any OTHER field (there are ~10 more) would
+// be invisible no matter how long the preview was.
+// This scans every field actually being sent, checks each character against
+// XML 1.0's real valid-Char production (not just the specific bad-char
+// classes sanitizeXmlText already knows to strip), and reports the exact
+// field, character, codepoint, and position — so the next failure identifies
+// the culprit directly instead of requiring another round of guessing.
+function findInvalidXmlChars(str) {
+  if (str == null) return null;
+  const s = String(str);
+  const bad = [];
+  let idx = 0;
+  for (const ch of s) {
+    const cp = ch.codePointAt(0);
+    const valid = cp === 0x9 || cp === 0xA || cp === 0xD ||
+      (cp >= 0x20 && cp <= 0xD7FF) ||
+      (cp >= 0xE000 && cp <= 0xFFFD) ||
+      (cp >= 0x10000 && cp <= 0x10FFFF);
+    if (!valid) {
+      bad.push({
+        field_index: idx,
+        codepoint: '0x' + cp.toString(16).toUpperCase(),
+        context: s.slice(Math.max(0, idx - 15), idx + 15),
+      });
+    }
+    idx += ch.length; // advance by UTF-16 code unit count (1 or 2 for this char)
+  }
+  return bad.length ? bad : null;
+}
+function scanValuesForInvalidXmlChars(values) {
+  const hits = [];
+  for (const [field, val] of Object.entries(values)) {
+    if (typeof val !== 'string') continue;
+    const bad = findInvalidXmlChars(val);
+    if (bad) hits.push({ field, bad });
+  }
+  return hits.length ? hits : null;
+}
+
 // Guards against NaN/Infinity, which are also invalid in XML-RPC.
 function safeNumber(n, fallback = 0) {
   const v = Number(n);
@@ -414,7 +460,15 @@ async function upsertBatch(config, products) {
   // round-trip at a time could take many HOURS wall-clock. Now runs with
   // bounded concurrency instead — same total number of calls, but many in
   // flight at once rather than waiting for each one before starting the next.
-  const WRITE_CONCURRENCY = 15;
+  // TEMP (Sep 2026): dropped from 15 to 5 as a diagnostic for the recurring
+  // "Invalid XML-RPC message" write failures — a tight burst of failures
+  // spanning completely unrelated products/manufacturers/SKUs, all within
+  // the same ~2s window, points at load/concurrency (a truncated response
+  // or connection-reuse issue under 15 parallel writes) rather than any
+  // single bad field or character — every implicated record was individually
+  // confirmed clean of invalid XML characters. Raise this back once that's
+  // confirmed or ruled out — this is not meant to be the permanent value.
+  const WRITE_CONCURRENCY = 5;
   for (let i = 0; i < toUpdate.length; i += WRITE_CONCURRENCY) {
     const window = toUpdate.slice(i, i + WRITE_CONCURRENCY);
     await Promise.all(window.map(({ odoo_id, values, sku }) =>
@@ -499,7 +553,36 @@ async function upsertBatch(config, products) {
           const numericPreview = ['list_price', 'standard_price', 'x_supplier_qty', 'categ_id']
             .map(f => `${f}=${JSON.stringify(values[f])}`)
             .join(' | ');
-          console.error(`[ODOO] write failed for id ${odoo_id}: ${e.message} — field preview: ${suspect} — numeric preview: ${numericPreview}`);
+          // NEW (Sep 2026): actually scan every field being sent (not just
+          // the 7-field shortlist above, and not truncated to 80 chars) for
+          // characters outside XML 1.0's valid range. If this finds
+          // something, it's the direct culprit — no more guessing.
+          const xmlCharHits = scanValuesForInvalidXmlChars(values);
+          const xmlCharReport = xmlCharHits
+            ? xmlCharHits.map(h => `${h.field}: [${h.bad.map(b => `${b.codepoint}@${b.field_index} ctx=${JSON.stringify(b.context)}`).join(', ')}]`).join(' || ')
+            : 'none found — bad char (if any) is not in a string field, or sanitizeXmlText already caught it';
+          // NEW (Sep 2026): the character scan above only ever inspects the
+          // OUTGOING request — it's blind to the possibility that "Invalid
+          // XML-RPC message" actually describes a malformed/truncated
+          // RESPONSE from Odoo (plausible given failures have clustered in
+          // tight ~2s bursts across totally unrelated products, which fits
+          // a load/concurrency issue better than a persistent bad field —
+          // every implicated record's stored data has also checked out
+          // clean). We don't know exactly what the xmlrpc library attaches
+          // to a parse-error object, so dump everything actually present on
+          // it rather than guess at property names that may not exist.
+          let errorDump;
+          try {
+            const props = Object.getOwnPropertyNames(e).filter(k => k !== 'stack');
+            errorDump = props.map(k => {
+              let v;
+              try { v = JSON.stringify(e[k]); } catch { v = String(e[k]); }
+              return `${k}=${v}`;
+            }).join(', ') || '(no own properties beyond message/stack)';
+          } catch (dumpErr) {
+            errorDump = `(error dump itself failed: ${dumpErr.message})`;
+          }
+          console.error(`[ODOO] write failed for id ${odoo_id}: ${e.message} — field preview: ${suspect} — numeric preview: ${numericPreview} — invalid-XML-char scan: ${xmlCharReport} — error object dump: ${errorDump}`);
         } else if (/Barcode\(s\) already assigned/i.test(e.message || '')) {
           // DIAGNOSTIC (Aug 2026): added after the "don't resend an
           // unchanged barcode" fix above — this error is STILL occurring
