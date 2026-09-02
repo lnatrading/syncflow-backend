@@ -270,6 +270,19 @@ async function upsertBatch(config, products) {
     ? { type: 'consu', is_storable: true }
     : { type: 'product' };
 
+  // NO currency conversion here (reverted Sep 2026) — cost_price/sale_price
+  // are Syncflow's canonical internal values, always in EUR by this point
+  // (AB.pl's raw PLN gets converted to EUR upstream in normaliseProduct;
+  // DCS/Mediamax/TD Baltic are already EUR-native at the source). EUR->PLN
+  // conversion for Odoo's PLN-based price fields is handled entirely on
+  // the Odoo side instead (a small module wrapping product.template.write()
+  // for both the Syncflow API user and ITscope's writes), so both feeds
+  // are converted by one single mechanism rather than Syncflow and Odoo
+  // each doing their own — avoids double-conversion risk and keeps the
+  // conversion rate in exactly one place. See that module for the actual
+  // rate/logic; if this file is ever read in isolation, remember that a
+  // plain pass-through here is intentional, not a missed fix.
+
   for (const product of products) {
     const values = {
       default_code:     sanitizeXmlText(product.sku),

@@ -2337,43 +2337,6 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
     }
   }
 
-  // CURRENCY CONVERSION (Aug 2026): confirmed real bug — AB.pl quotes every
-  // price in PLN (raw.currency = "PLN", confirmed via live Postman testing
-  // and production sample data), but cost_price/sale_price were being
-  // written straight through with NO conversion, so a 100 PLN item (≈ €23)
-  // was stored and displayed as €100 — a ~4.3x overpricing on every single
-  // AB.pl product. DCS/Mediamax/TD Baltic feeds either omit a currency
-  // field entirely or already report "EUR" (TD Baltic confirmed: raw
-  // sample shows "Currency":"EUR"), so this is a no-op for them — only
-  // fires for a recognized NON-EUR currency.
-  //
-  // Rate is a static approximation, NOT a live feed — accuracy drifts over
-  // time and needs periodic manual updates (env var override available).
-  // A live FX API would be more accurate long-term but adds an external
-  // dependency/failure point to every sync; flagged as a possible future
-  // improvement, not implemented here.
-  const CURRENCY_TO_EUR_RATE = {
-    PLN: parseFloat(process.env.PLN_TO_EUR_RATE) || 0.234, // ~4.27 PLN/EUR, Aug 2026 approx — used only if the live rate fetch fails
-  };
-  const rawCurrency = (raw.currency || raw.Currency || '').toUpperCase();
-  if (rawCurrency && rawCurrency !== 'EUR') {
-    // Prefer AB.pl's own live rate (raw.__abEurRate = "1 EUR = X PLN",
-    // attached once per sync above) over the static approximation.
-    const rate = (rawCurrency === 'PLN' && raw.__abEurRate)
-      ? (1 / raw.__abEurRate)
-      : CURRENCY_TO_EUR_RATE[rawCurrency];
-    if (rate) {
-      if (typeof product.cost_price === 'number' || typeof product.cost_price === 'string') {
-        const n = parseFloat(product.cost_price);
-        if (Number.isFinite(n)) product.cost_price = parseFloat((n * rate).toFixed(2));
-      }
-      if (typeof product.sale_price === 'number' || typeof product.sale_price === 'string') {
-        const n = parseFloat(product.sale_price);
-        if (Number.isFinite(n)) product.sale_price = parseFloat((n * rate).toFixed(2));
-      }
-    }
-  }
-
   // Fallbacks for common field names
   // Note: XML parsed with attributeNamePrefix '@_', so TD Baltic fields come as @_TDPartNbr etc.
   if (!product.sku)        product.sku        = raw.SKU || raw.sku || raw.ref || raw.code || raw.id || raw.elkoCode
@@ -2397,6 +2360,54 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
                                                || raw['@_Price'] || raw.Price || 0);
   if (!product.sale_price) product.sale_price = parseFloat(raw.price || raw.sale_price || raw.list_price
                                                || raw['@_Price'] || raw.Price || 0);
+
+  // CURRENCY CONVERSION (Aug 2026, moved Sep 2026): confirmed real bug —
+  // AB.pl quotes every price in PLN (raw.currency = "PLN", confirmed via
+  // live Postman testing and production sample data). DCS/Mediamax/TD
+  // Baltic feeds either omit a currency field entirely or already report
+  // "EUR" (TD Baltic confirmed: raw sample shows "Currency":"EUR"), so
+  // this is a no-op for them — only fires for a recognized NON-EUR
+  // currency.
+  //
+  // MOVED (Sep 2026): this block used to run BEFORE the two fallback
+  // assignments directly above, back when it only checked whether
+  // product.cost_price/sale_price already had a value. That meant it only
+  // actually converted a field if an explicit Field Mapping rule had
+  // already set it earlier in this function — for AB specifically, that
+  // was true for sale_price (mapped explicitly) but NOT cost_price (which
+  // only ever got set by the fallback above, which ran AFTER this block).
+  // Result: AB's sale_price got correctly converted to EUR, while
+  // cost_price silently stayed raw, unconverted PLN — an internal
+  // inconsistency between the two fields, confirmed against live product
+  // data (a €7316 "cost" that was actually 7316 PLN, next to a correctly-
+  // converted ~€1689 sale price on the same product). Running this AFTER
+  // both fallbacks guarantees both fields are populated — from an explicit
+  // mapping or the generic fallback, either way — before conversion is
+  // attempted, so it now reliably applies to both.
+  //
+  // Rate is a static approximation, NOT a live feed — accuracy drifts over
+  // time and needs periodic manual updates (env var override available).
+  // A live FX API would be more accurate long-term but adds an external
+  // dependency/failure point to every sync; flagged as a possible future
+  // improvement, not implemented here.
+  const CURRENCY_TO_EUR_RATE = {
+    PLN: parseFloat(process.env.PLN_TO_EUR_RATE) || 0.234, // ~4.27 PLN/EUR, Aug 2026 approx — used only if the live rate fetch fails
+  };
+  const rawCurrency = (raw.currency || raw.Currency || '').toUpperCase();
+  if (rawCurrency && rawCurrency !== 'EUR') {
+    // Prefer AB.pl's own live rate (raw.__abEurRate = "1 EUR = X PLN",
+    // attached once per sync above) over the static approximation.
+    const rate = (rawCurrency === 'PLN' && raw.__abEurRate)
+      ? (1 / raw.__abEurRate)
+      : CURRENCY_TO_EUR_RATE[rawCurrency];
+    if (rate) {
+      const costN = parseFloat(product.cost_price);
+      if (Number.isFinite(costN)) product.cost_price = parseFloat((costN * rate).toFixed(2));
+      const saleN = parseFloat(product.sale_price);
+      if (Number.isFinite(saleN)) product.sale_price = parseFloat((saleN * rate).toFixed(2));
+    }
+  }
+
   if (!product.stock_qty)  product.stock_qty  = parseInt(raw.qty || raw.stock || raw.quantity || raw.qty_available || raw.availableQty
                                                || raw['@_Stock'] || raw.Stock || 0, 10);
   if (!product.image_url)  product.image_url  = raw.image || raw.image_url || raw.img || raw.imageUrl || null;
