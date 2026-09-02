@@ -890,11 +890,37 @@ async function runSupplierSyncInner(supabase, supplier) {
         }
       }
 
+      // Resolve each product's "My Category" label into a real Odoo
+      // product.category id, so categ_id actually gets populated on the
+      // Odoo push. getOrCreateCategoryHierarchy() has existed in
+      // odooClient.js for a while but was never actually called anywhere
+      // in this sync flow — confirmed via a live product read (categ_id:
+      // false) that this has genuinely never been set, for any product,
+      // from any supplier, until now. Resolved once per sync run across
+      // all distinct category paths in this batch (not once per product,
+      // which would mean redundant search/create calls for shared parent
+      // segments like "Computing" across dozens of subcategories).
+      const distinctCategoryPaths = [...new Set(toExport.map(p => p.category).filter(Boolean))];
+      if (distinctCategoryPaths.length) {
+        try {
+          const categoryIdMap = await odooClient.getOrCreateCategoryHierarchy(odooConfig, distinctCategoryPaths);
+          let categorized = 0;
+          for (const p of toExport) {
+            if (p.category && categoryIdMap.has(p.category)) {
+              p.odoo_category_id = categoryIdMap.get(p.category);
+              categorized++;
+            }
+          }
+          console.log(`[ODOO] ${supplier.name} — resolved ${distinctCategoryPaths.length} distinct category path(s), applied to ${categorized}/${toExport.length} product(s)`);
+        } catch (e) {
+          console.warn(`[ODOO] ${supplier.name} — category hierarchy resolution failed, categ_id will stay unset this run: ${e.message}`);
+        }
+      }
+
       const batches = [];
       for (let i = 0; i < toExport.length; i += ODOO_CHUNK) {
         batches.push(toExport.slice(i, i + ODOO_CHUNK));
       }
-
       for (let i = 0; i < batches.length; i += ODOO_CONCURRENCY) {
         const window = batches.slice(i, i + ODOO_CONCURRENCY);
         const results = await Promise.allSettled(
