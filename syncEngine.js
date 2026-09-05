@@ -142,6 +142,10 @@ async function runSupplierSyncInner(supabase, supplier) {
     // pulling the full catalog. This respects supplier infrastructure limits.
     const productsEndpoint   = endpoints.find(e => e.role === 'products');
     const fastUpdateEndpoint = endpoints.find(e => e.role === 'fast_update');
+    // Optional dedicated stock endpoint (e.g. AB.pl's req=stocks — see
+    // fetchAbStockLevels-turned-generic-endpoint note in runFastUpdate).
+    // Purely additive: suppliers without one behave exactly as before.
+    const stockEndpoint      = endpoints.find(e => e.role === 'stock');
 
     if (!productsEndpoint) throw new Error('No endpoint with role "products" found.');
 
@@ -150,8 +154,27 @@ async function runSupplierSyncInner(supabase, supplier) {
     // the frequency gate only applies to scheduled/cron-triggered syncs.
     const force = supplier._force === true;
     if (!productsDue && !force && fastUpdateEndpoint) {
+      // FIX (Sep 2026): this used to call runFastUpdate unconditionally
+      // whenever the main products endpoint wasn't due, completely
+      // ignoring fastUpdateEndpoint's OWN sync_freq_minutes — so setting
+      // e.g. 360 minutes on the fast_update endpoint had no effect at all;
+      // it just ran on whatever cadence the top-level cron/scheduler fired
+      // (confirmed against AB Poland's sync_jobs history: hourly, every
+      // time, regardless of its configured frequency). last_synced_at for
+      // this endpoint WAS already being updated correctly on every run
+      // (see step 8 in runFastUpdate) — isEndpointDue() just was never
+      // actually being consulted before deciding to run it.
+      const fastUpdateDue = isEndpointDue(fastUpdateEndpoint);
+      if (!fastUpdateDue) {
+        console.log(`[SYNC] ${supplier.name} — neither products nor fast_update endpoint due yet (fast_update sync_freq_minutes=${fastUpdateEndpoint.sync_freq_minutes}, last_synced_at=${fastUpdateEndpoint.last_synced_at}). Skipping this cycle.`);
+        await supabase.from('sync_jobs').update({
+          status: 'success', products_total: 0, products_updated: 0,
+          products_created: 0, products_errors: 0, finished_at: new Date(),
+        }).eq('id', jobId);
+        return;
+      }
       console.log(`[SYNC] ${supplier.name} — products endpoint not due (sync_freq_minutes=${productsEndpoint.sync_freq_minutes}, last_synced_at=${productsEndpoint.last_synced_at}). Running fast update only.`);
-      await runFastUpdate(supabase, supplier, fastUpdateEndpoint, auth, jobId, activeVersion);
+      await runFastUpdate(supabase, supplier, fastUpdateEndpoint, stockEndpoint, auth, jobId, activeVersion);
       return;
     }
     if (force && !productsDue) {
@@ -1181,7 +1204,7 @@ function isEndpointDue(endpoint) {
 // What it does NOT do:
 //   • Add new SKUs (they appear on the next full catalog sync)
 //   • Update name/desc/images/category (those come from the catalog)
-async function runFastUpdate(supabase, supplier, endpoint, auth, jobId, activeVersion) {
+async function runFastUpdate(supabase, supplier, endpoint, stockEndpoint, auth, jobId, activeVersion) {
   const startTs = Date.now();
 
   // 1. Fetch the fast feed
@@ -1199,10 +1222,60 @@ async function runFastUpdate(supabase, supplier, endpoint, auth, jobId, activeVe
     return;
   }
 
+  // 1b. Some suppliers' fast feed carries price only, no stock (confirmed
+  // for AB.pl's price_fat_free — see the "AB.pl FIX" comments elsewhere in
+  // this file: only abpn/price/currency/vat, nothing quantity-related).
+  // A dedicated 'stock' endpoint (e.g. AB's req=stocks) fixes this the same
+  // way any other secondary endpoint works — fetched via the normal
+  // fetchEndpoint() path, respecting its own sync_freq_minutes gate, using
+  // the SAME auth as everything else for this supplier. Purely additive:
+  // suppliers without a 'stock' endpoint configured fall through to the
+  // "preserve existing stock" behaviour below exactly as before.
+  //
+  // AB's req=stocks response is <stock><id>..</id><abpn>..</abpn>
+  // <instock>N</instock>...</stock> — plain elements, no attribute prefix,
+  // so findFirst's existing 'abpn'/'id' check (in fetchEndpoint) already
+  // matches this shape with no further parser changes needed. Per AB's own
+  // docs, a product NOT present in this response has 0 stock (not "no
+  // data") — so a successful fetch is authoritative and applied directly,
+  // including as an explicit 0 for anything absent.
+  let abStockByAbpn = null;
+  if (stockEndpoint) {
+    const stockDue = isEndpointDue(stockEndpoint);
+    if (stockDue) {
+      try {
+        const stockUrl = versionResolver.resolveEndpointUrl(stockEndpoint, activeVersion);
+        console.log(`[FAST-SYNC] ${supplier.name} — fetching stock: ${stockUrl}`);
+        const rawStock = await fetchEndpoint(stockUrl, stockEndpoint.format, auth);
+        if (Array.isArray(rawStock) && rawStock.length) {
+          abStockByAbpn = new Map();
+          for (const s of rawStock) {
+            const abpn = s.abpn ?? s['@_abpn'];
+            const qty = parseInt(s.instock ?? s['@_instock'], 10);
+            if (abpn != null && Number.isFinite(qty)) abStockByAbpn.set(String(abpn), qty);
+          }
+          if (!abStockByAbpn.size) {
+            console.warn(`[FAST-SYNC] ${supplier.name} — stock endpoint returned data but no usable abpn/instock pairs — preserving existing stock instead`);
+            abStockByAbpn = null;
+          } else if (stockEndpoint.sync_freq_minutes > 0) {
+            await supabase.from('supplier_endpoints')
+              .update({ last_synced_at: new Date() }).eq('id', stockEndpoint.id);
+          }
+        } else {
+          console.warn(`[FAST-SYNC] ${supplier.name} — stock endpoint returned no records — preserving existing stock instead`);
+        }
+      } catch (e) {
+        console.warn(`[FAST-SYNC] ${supplier.name} — stock endpoint fetch failed, preserving existing stock instead: ${e.message}`);
+      }
+    } else {
+      console.log(`[FAST-SYNC] ${supplier.name} — stock endpoint not due yet (sync_freq_minutes=${stockEndpoint.sync_freq_minutes}), skipping this cycle`);
+    }
+  }
+
   // 2. Load existing products for this supplier (sku → row)
   const { data: existing } = await supabase
     .from('products')
-    .select('id, sku, cost_price, sale_price, category, shipping_cost')
+    .select('id, sku, cost_price, sale_price, category, shipping_cost, stock_qty, status')
     .eq('supplier_id', supplier.id);
   const bySku = new Map((existing || []).map(p => [p.sku, p]));
   console.log(`[FAST-SYNC] ${supplier.name} — ${existing?.length || 0} known SKUs in DB, ${rawItems.length} in feed`);
@@ -1232,13 +1305,30 @@ async function runFastUpdate(supabase, supplier, endpoint, auth, jobId, activeVe
     if (!existingRow) { unknownSkus++; continue; }
 
     const cost_price = parseFloat(item.price || item.cost || item.cost_price || item['@_price'] || 0);
-    // NOTE: no quantity/stock attribute observed in the AB.pl price_fat_free
-    // sample checked (only abpn/price/currency/vat) — if AB genuinely omits
-    // stock from this feed, stock_qty will fall through to 0 (marking the
-    // product 'unavailable') for every AB item here. Confirm against a
-    // fuller raw sample before relying on this fast feed for AB stock
-    // updates; the main full-sync feed's instock field is unaffected.
-    const stock_qty  = parseInt(item.qty || item.quantity || item.stock || item['@_qty'] || item['@_instock'] || 0, 10);
+
+    // Stock resolution priority:
+    //   1. AB's dedicated req=stocks response (authoritative when present —
+    //      see fetchAbStockLevels; absence of this SKU there means 0, per
+    //      AB's docs, so that's applied directly, not treated as "unknown").
+    //   2. A qty-like field on the item itself (other suppliers' fast feeds).
+    //   3. If neither exists (e.g. the req=stocks call itself failed this
+    //      run), preserve whatever the last full sync set rather than
+    //      defaulting to 0/unavailable.
+    let stock_qty, status;
+    if (abStockByAbpn) {
+      const abpnKey = item['@_abpn'] || sku;
+      stock_qty = abStockByAbpn.has(String(abpnKey)) ? abStockByAbpn.get(String(abpnKey)) : 0;
+      status = stock_qty <= 0 ? 'unavailable' : stock_qty <= 5 ? 'low' : 'active';
+    } else {
+      const hasQtyField = item.qty !== undefined || item.quantity !== undefined || item.stock !== undefined
+                        || item['@_qty'] !== undefined || item['@_instock'] !== undefined;
+      stock_qty = hasQtyField
+        ? parseInt(item.qty || item.quantity || item.stock || item['@_qty'] || item['@_instock'] || 0, 10)
+        : existingRow.stock_qty;
+      status = hasQtyField
+        ? (stock_qty <= 0 ? 'unavailable' : stock_qty <= 5 ? 'low' : 'active')
+        : existingRow.status;
+    }
 
     // Apply markup rule (category-specific first, then default)
     let sale_price = cost_price;
@@ -1258,7 +1348,7 @@ async function runFastUpdate(supabase, supplier, endpoint, auth, jobId, activeVe
       cost_price,
       sale_price,
       stock_qty,
-      status:      stock_qty <= 0 ? 'unavailable' : stock_qty <= 5 ? 'low' : 'active',
+      status,
       // Forecast 24h availability (Mediamax qty2) — stored for visibility
       _qty2:       item.qty2 != null ? parseInt(item.qty2, 10) : null,
     });
@@ -1456,6 +1546,14 @@ async function fetchAbEurRate(auth) {
     return null;
   }
 }
+
+// NOTE (Sep 2026): a bespoke fetchAbStockLevels() used to live here,
+// hand-rolling its own axios POST for req=stocks. Replaced by wiring
+// req=stocks in as a normal 'stock'-role supplier_endpoints row, fetched
+// through the same generic fetchEndpoint() path every other endpoint uses
+// (see runFastUpdate's stock-fetch block, and mergeEndpointData's existing
+// `case 'stock'` handling for the full-sync path). Keeps AB.pl's stock
+// cadence configurable from the dashboard instead of hardcoded here.
 
 async function fetchEndpoint(urlTemplate, format, auth, templateValues = {}) {
   // Substitute any {placeholder} tokens in the URL (parameterised endpoints)
@@ -2660,6 +2758,17 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
   // near the top of this function. Do not re-add it here: this point in
   // the function runs AFTER conversion, so setting cost_price this late
   // would reintroduce the raw-PLN-mislabeled-as-EUR bug.)
+  //
+  // STOCK (Sep 2026): if a dedicated 'stock' endpoint (AB's req=stocks) is
+  // configured, mergeEndpointData() above already attached its matched
+  // record as raw._stockData — {id, abpn, instock, ...}, confirmed real
+  // shape per AB's docs. That's a more authoritative, dedicated source
+  // than the main products_all feed's own instock field, so prefer it
+  // outright when present (not just as a fallback for a missing value).
+  if (raw._stockData && raw._stockData.instock !== undefined && raw._stockData.instock !== null) {
+    const qty = parseInt(raw._stockData.instock, 10);
+    if (Number.isFinite(qty)) product.stock_qty = qty;
+  }
   if (product.stock_qty == null || product.stock_qty === 0) {
     // CONFIRMED: instock is a STRING like "30+" (meaning "30 or more"),
     // not a bare number or per-site object as originally guessed. Strip
