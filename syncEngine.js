@@ -2387,6 +2387,29 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
   if (!product.sale_price) product.sale_price = parseFloat(raw.price || raw.sale_price || raw.list_price
                                                || raw['@_Price'] || raw.Price || 0);
 
+  // AB.pl FIX (Sep 2026): AB's feed exposes only a single `price` field —
+  // no distinct cost field at all (confirmed via Postman; real fields are
+  // `currency, price, vat`, nothing named cost/cost_price/wholesale_price).
+  // The generic cost fallback just above never matches AB's raw field name,
+  // so product.cost_price was still 0 at this point for every AB product.
+  // This used to be handled by a duplicate fallback further down in the
+  // AB.pl-specific section (search "AB.pl (AB S.A.) product feed fields"),
+  // but that block runs AFTER the currency conversion below — so it set
+  // cost_price directly from raw AB PLN price with NO conversion applied,
+  // while sale_price (set from the same raw.price a few lines above) DID
+  // get converted. Result: cost_price ended up as a raw PLN number
+  // mislabeled as EUR, which the downstream Odoo eur_pln_price_conversion
+  // module then multiplied by its own PLN rate a second time — e.g. a
+  // product with a true ~€216 cost/sale ended up showing a ~3,995 PLN
+  // "cost" (216 -> 935.71 raw PLN here, unconverted -> 935.71 x 4.27 in
+  // Odoo -> 3995.48), while the correctly-converted sale price was fine.
+  // Moved here (before conversion) so AB's cost_price gets the same
+  // PLN->EUR treatment as sale_price. Safe for every other supplier: this
+  // only fires when cost_price is still unset, exactly as before.
+  if (!product.cost_price || product.cost_price === 0) {
+    product.cost_price = parseFloat(raw.price) || product.cost_price || 0;
+  }
+
   // CURRENCY CONVERSION (Aug 2026, moved Sep 2026): confirmed real bug —
   // AB.pl quotes every price in PLN (raw.currency = "PLN", confirmed via
   // live Postman testing and production sample data). DCS/Mediamax/TD
@@ -2595,9 +2618,11 @@ function normaliseProduct(raw, mappings, markupRules, shippingTiers = []) {
   } else if (!product.brand && raw.producer_id) {
     product.brand = String(raw.producer_id); // fallback only — not a real name
   }
-  if (!product.cost_price || product.cost_price === 0) {
-    product.cost_price = parseFloat(raw.price) || product.cost_price || 0;
-  }
+  // (cost_price fallback for AB's raw `price` field was moved above the
+  // currency-conversion block — see the "AB.pl FIX (Sep 2026)" comment
+  // near the top of this function. Do not re-add it here: this point in
+  // the function runs AFTER conversion, so setting cost_price this late
+  // would reintroduce the raw-PLN-mislabeled-as-EUR bug.)
   if (product.stock_qty == null || product.stock_qty === 0) {
     // CONFIRMED: instock is a STRING like "30+" (meaning "30 or more"),
     // not a bare number or per-site object as originally guessed. Strip
