@@ -288,7 +288,25 @@ async function upsertBatch(config, products) {
   // rate/logic; if this file is ever read in isolation, remember that a
   // plain pass-through here is intentional, not a missed fix.
 
+  // BRAND (Sep 2026): resolve every product's brand name into a real
+  // x_brand record ID up front, once per batch — same pattern as
+  // getOrCreateCategoryHierarchy — rather than a separate search/create
+  // round-trip per product. Reuses the exact same "purely numeric isn't
+  // a real brand" guard as the existing itscope_manufacturer write below,
+  // so a bare fallback producer_id never creates a garbage Brand record
+  // either. See getOrCreateBrandIds above for why this exists: Icecat's
+  // Odoo connector needs this real related field to match products,
+  // separate from and in addition to the plain-text itscope_manufacturer
+  // field, which stays exactly as it was.
+  const realBrandNames = products
+    .map(p => (p.brand && !/^\d+$/.test(String(p.brand).trim())) ? String(p.brand).trim() : null)
+    .filter(Boolean);
+  const brandNameToId = await getOrCreateBrandIds(config, realBrandNames);
+
   for (const product of products) {
+    const hasRealBrand = product.brand && !/^\d+$/.test(String(product.brand).trim());
+    const realBrandName = hasRealBrand ? String(product.brand).trim() : null;
+
     const values = {
       default_code:     sanitizeXmlText(product.sku),
       barcode:          sanitizeXmlText(product.ean) || false,
@@ -315,6 +333,14 @@ async function upsertBatch(config, products) {
       // more attributes get mapped, no Odoo-side changes ever needed again.
       // Requires custom Text field x_specifications on product.template in Odoo.
       ...(product.specs_summary ? { x_specifications: sanitizeXmlText(product.specs_summary) } : {}),
+      // BRAND, real related field (Sep 2026) — for Icecat's connector,
+      // which requires an actual x_brand record, not just text. Left
+      // OUT entirely (not even sent as false) when this product has no
+      // real brand this run, same philosophy as the other optional
+      // fields above: never clobber an existing value with nothing just
+      // because this particular source didn't have it.
+      ...(realBrandName && brandNameToId.has(realBrandName)
+        ? { x_studio_brand_id: brandNameToId.get(realBrandName) } : {}),
       // Brand/manufacturer — confirmed (Aug 2026, Odoo field list) that no
       // Syncflow-specific brand field exists, but itscope_manufacturer
       // (Char, product.template) already does — created for the separate
@@ -970,6 +996,61 @@ async function getOrCreateCategoryHierarchy(config, categoryPaths) {
       parentId = id;
     }
     result.set(path, parentId);
+  }
+
+  return result;
+}
+
+// ── BRAND (Odoo Studio custom model x_brand, Sep 2026) ────────────────
+// Icecat's Odoo connector requires products to carry a genuine RELATED
+// Brand record (not a plain text field) to match against their PIM —
+// configured on their side as Model Name x_brand / ID Field id / Name
+// Field x_name / Product Relation Field x_studio_brand_id (built via
+// Studio; see /areas/icecat-subscription.md). This resolves a batch of
+// brand name strings into x_brand record ids, creating any that don't
+// exist yet — same one-call-per-batch pattern as
+// getOrCreateCategoryHierarchy above, so a brand shared across many
+// products in one sync only gets searched/created once, not once per
+// product. Returns a Map of brand name -> x_brand id.
+//
+// Deliberately separate from the existing itscope_manufacturer Char
+// field (left untouched) — that field is still written to directly in
+// upsertBatch below, same as before. This just ALSO populates the real
+// related field Icecat's connector actually reads, without touching or
+// depending on the old text field.
+async function getOrCreateBrandIds(config, brandNames) {
+  const uid = await authenticate(config);
+  const { object } = getClients(config.url);
+
+  const distinct = [...new Set(brandNames.filter(Boolean))];
+  if (!distinct.length) return new Map();
+
+  const existing = await call(object, 'execute_kw', [
+    config.database, uid, config.api_key,
+    'x_brand', 'search_read',
+    [[['x_name', 'in', distinct]]],
+    { fields: ['id', 'x_name'] }
+  ]);
+
+  const result = new Map(existing.map(r => [r.x_name, r.id]));
+
+  const missing = distinct.filter(name => !result.has(name));
+  for (const name of missing) {
+    // One create() per missing brand rather than a single batch create —
+    // deliberately, so one bad name (e.g. an XML-invalid character that
+    // slips past sanitizeXmlText somehow) can't fail every brand in this
+    // sync; matches the same per-record resilience philosophy already
+    // used for product creates elsewhere in this file.
+    try {
+      const [id] = await call(object, 'execute_kw', [
+        config.database, uid, config.api_key,
+        'x_brand', 'create',
+        [[{ x_name: name }]]
+      ]);
+      result.set(name, id);
+    } catch (e) {
+      console.warn(`[ODOO] Could not create Brand record for "${name}": ${e.message}`);
+    }
   }
 
   return result;
