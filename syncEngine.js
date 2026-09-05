@@ -1214,14 +1214,31 @@ async function runFastUpdate(supabase, supplier, endpoint, auth, jobId, activeVe
   // 4. Build incoming updates — only for SKUs we already know
   const incoming = [];     // for sanity check + Odoo push
   let unknownSkus = 0;
+  let unparsableSkus = 0;
   for (const item of rawItems) {
-    const sku = item.sku || item.SKU || item.ref || item.code;
-    if (!sku) continue;
+    // FIX (Sep 2026): AB.pl's price_fat_free response puts the item's
+    // identifier/price as XML ATTRIBUTES (parsed as '@_abpn'/'@_price'
+    // with attributeNamePrefix: '@_' — see the array-detection fix above
+    // for the exact shape). None of the plain sku/price keys below ever
+    // matched that shape, so `sku` was undefined for every AB fast-update
+    // item and silently `continue`d — uncounted, unlogged — which is why
+    // every AB Poland fast-sync job showed products_updated: 0. abpn is
+    // the vendor SKU used consistently elsewhere for AB (see
+    // normaliseProduct's `product.sku = raw.abpn` for the full feed), so
+    // it's the correct match for item.sku here too.
+    const sku = item.sku || item.SKU || item.ref || item.code || item['@_abpn'];
+    if (!sku) { unparsableSkus++; continue; }
     const existingRow = bySku.get(String(sku));
     if (!existingRow) { unknownSkus++; continue; }
 
-    const cost_price = parseFloat(item.price || item.cost || item.cost_price || 0);
-    const stock_qty  = parseInt(item.qty || item.quantity || item.stock || 0, 10);
+    const cost_price = parseFloat(item.price || item.cost || item.cost_price || item['@_price'] || 0);
+    // NOTE: no quantity/stock attribute observed in the AB.pl price_fat_free
+    // sample checked (only abpn/price/currency/vat) — if AB genuinely omits
+    // stock from this feed, stock_qty will fall through to 0 (marking the
+    // product 'unavailable') for every AB item here. Confirm against a
+    // fuller raw sample before relying on this fast feed for AB stock
+    // updates; the main full-sync feed's instock field is unaffected.
+    const stock_qty  = parseInt(item.qty || item.quantity || item.stock || item['@_qty'] || item['@_instock'] || 0, 10);
 
     // Apply markup rule (category-specific first, then default)
     let sale_price = cost_price;
@@ -1249,6 +1266,9 @@ async function runFastUpdate(supabase, supplier, endpoint, auth, jobId, activeVe
 
   if (unknownSkus > 0) {
     console.warn(`[FAST-SYNC] ${supplier.name} — ${unknownSkus} SKUs in feed not yet in DB (will be added on next full catalog sync)`);
+  }
+  if (unparsableSkus > 0) {
+    console.warn(`[FAST-SYNC] ${supplier.name} — ${unparsableSkus} item(s) had no extractable SKU (unrecognized field shape) — check the raw feed format`);
   }
 
   // 5. Price sanity check — same thresholds as full sync
@@ -1593,8 +1613,25 @@ async function fetchEndpoint(urlTemplate, format, auth, templateValues = {}) {
 
     // Find the array of product/category records in the parsed tree
     // rather than assuming an exact nesting path (see VERIFY note above).
+    //
+    // FIX (Sep 2026): the price_fat_free ("fast update") response shape
+    // puts abpn/price/currency/vat as XML ATTRIBUTES with the numeric id
+    // as the element's plain text content — e.g.
+    // <product abpn="..." price="..." currency="PLN" vat="23">1037254</product>
+    // The parser (attributeNamePrefix: '@_') turns that into
+    // { '@_abpn': '...', '@_price': '...', '#text': '1037254' } — no bare
+    // `abpn`/`id`/`parentid` key exists on this shape at all, so the
+    // original unprefixed-only check below always failed for this mode,
+    // logging a false "no recognizable item array" warning and returning
+    // [] even for a fully valid, data-filled response (confirmed via a
+    // live curl: real 100+ product array, zero actual error). The
+    // pricedata/full-feed shape (plain `id`/`abpn` fields, no attrs) still
+    // matches the original unprefixed check, so both are kept.
     const arr = findFirst(parsed, n => Array.isArray(n) && n.length > 0 &&
-      typeof n[0] === 'object' && ('id' in n[0] || 'abpn' in n[0] || 'parentid' in n[0]));
+      typeof n[0] === 'object' && (
+        'id' in n[0] || 'abpn' in n[0] || 'parentid' in n[0] ||
+        '@_id' in n[0] || '@_abpn' in n[0] || '@_parentid' in n[0]
+      ));
     if (!arr) {
       // DIAGNOSTIC (Aug 2026): this used to silently return [] here,
       // indistinguishable from a genuinely-empty-but-successful AB.pl
