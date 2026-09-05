@@ -243,12 +243,17 @@ async function upsertBatch(config, products) {
     config.database, uid, config.api_key,
     'product.template', 'search_read',
     [domain],
-    { fields: ['id', 'default_code', 'barcode'], limit: skus.length + eans.length }
+    { fields: ['id', 'default_code', 'barcode', 'name'], limit: skus.length + eans.length }
   ]);
 
   const existingBySku     = Object.fromEntries(existing.filter(r => r.default_code).map(r => [r.default_code, r.id]));
   const existingByBarcode = Object.fromEntries(existing.filter(r => r.barcode).map(r => [r.barcode, r.id]));
   const existingBarcodeById = Object.fromEntries(existing.map(r => [r.id, r.barcode || false]));
+  // FIX (Sep 2026): `name` was never fetched here, so there was no way to
+  // tell a genuinely-enriched name from a broken placeholder before
+  // deciding whether to touch it on update (see the name-healing check
+  // below, right before toUpdate.push).
+  const existingNameById = Object.fromEntries(existing.map(r => [r.id, r.name || '']));
 
   const toCreate = [];
   const toUpdate = []; // [{ odoo_id, values }]
@@ -397,6 +402,41 @@ async function upsertBatch(config, products) {
       // successful pattern as matchedViaBarcodeOnly (the WiFi Adapter
       // case) above, just reached from the other direction.
       crossRecordRedirects[product.sku] = barcodeMatchId;
+      // FIX (Sep 2026): this used to happen with zero trace — a blank
+      // barcode on a SKU-matched record looked identical whether it was
+      // a genuine collision (this branch) or simply never set. Logging it
+      // here makes the two distinguishable from the Railway logs alone,
+      // without needing to manually query Odoo for every suspiciously
+      // blank barcode.
+      console.warn(`[ODOO] Barcode collision: sku=${product.sku} (record #${skuMatchId}) wants EAN ${product.ean}, already claimed by record #${barcodeMatchId} — barcode left untouched on #${skuMatchId} this run`);
+    }
+
+    // NAME-HEALING (Sep 2026): `values` deliberately never includes `name`
+    // on update (see the toCreate comment below) — that protects
+    // Icecat/ITscope-enriched names from being clobbered. But that also
+    // means: if a record was ever first CREATED while product.name was
+    // empty (any historical parsing gap, any supplier — confirmed with
+    // both AB.pl and DCS), it got created with name = its own SKU as a
+    // placeholder, and then stayed that way FOREVER, since no update ever
+    // touches name again — even after the upstream feed has had a correct
+    // name for months. There was no path back to a real name at all.
+    // Narrow, safe fix: only ever overwrite an EXISTING name when it looks
+    // like exactly this broken placeholder — purely numeric, or literally
+    // identical to the record's own SKU/default_code. A genuinely enriched
+    // name (Icecat, ITscope, or a real supplier-provided name) is never
+    // just digits and never exactly equals the SKU, so this can't clobber
+    // real enrichment; it only heals records stuck in the known-broken state.
+    if (matchedId) {
+      const existingName = (existingNameById[matchedId] || '').trim();
+      const nameLooksBroken = existingName !== '' &&
+        (/^\d+$/.test(existingName) || existingName === String(product.sku));
+      const newNameLooksReal = product.name &&
+        !/^\d+$/.test(String(product.name).trim()) &&
+        String(product.name).trim() !== String(product.sku);
+      if (nameLooksBroken && newNameLooksReal) {
+        values.name = sanitizeXmlText(product.name);
+        console.log(`[ODOO] Healing broken name on record #${matchedId} (sku=${product.sku}): "${existingName}" -> "${product.name}"`);
+      }
     }
 
     if (matchedId) {
