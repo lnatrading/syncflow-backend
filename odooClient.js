@@ -726,44 +726,44 @@ async function syncVendorPricing(config, partnerId, items) {
   const uid = await authenticate(config);
   const { object } = getClients(config.url);
 
-  // FIX (Sep 2026): confirmed real bug — this write only ever sent a bare
-  // {price} number, no currency_id, onto product.supplierinfo.price (the
-  // Purchase-tab vendor line — a DIFFERENT field from product.template's
-  // standard_price/list_price, which eur_pln_price_conversion already
-  // handles on the Odoo side; this field is untouched by that module).
-  // Confirmed live in Odoo: a product correctly showing 799.17 zł Cost
-  // on General Information, right next to "187.16 PLN" on its own
-  // Purchase-tab vendor line — the same EUR number (187.16), just
-  // mislabeled as PLN instead of converted.
-  // Syncflow's cost_price is always EUR by this point (see the
-  // no-conversion note in upsertBatch above), and product.supplierinfo
-  // genuinely supports a per-line currency in Odoo — unlike
-  // product.template's price fields, which don't carry their own
-  // currency and rely on the company-currency assumption. So the fix
-  // here is to ADD currency_id, not convert the number — exactly what
-  // ITscope's own supplier_mixin.py already does on its equivalent
-  // writes (confirmed earlier by reading their source, which is why
-  // ITscope-created vendor lines display correctly without any fix).
-  // Looked up once per call rather than hardcoded, in case this Odoo
-  // instance's EUR currency record ID ever changes; falls back to the
-  // old no-currency behavior (silently assumed PLN, same bug as before)
-  // only if EUR genuinely can't be found, so a lookup hiccup degrades
-  // to the prior behavior instead of failing every price sync outright.
-  let eurCurrencyId = null;
-  try {
-    const eurCurrency = await call(object, 'execute_kw', [
-      config.database, uid, config.api_key,
-      'res.currency', 'search_read',
-      [[['name', '=', 'EUR']]],
-      { fields: ['id'], limit: 1 }
-    ]);
-    eurCurrencyId = eurCurrency[0]?.id || null;
-    if (!eurCurrencyId) {
-      console.warn('[ODOO] EUR currency not found in res.currency — supplierinfo price will write without currency_id (same as before this fix)');
-    }
-  } catch (e) {
-    console.warn('[ODOO] Could not look up EUR currency id — supplierinfo price will write without currency_id (same as before this fix):', e.message);
-  }
+  // FIX (Sep 2026, CORRECTED): confirmed real bug — this write only ever
+  // sent a bare {price} number, no currency_id, onto
+  // product.supplierinfo.price (the Purchase-tab vendor line — a
+  // DIFFERENT field from product.template's standard_price/list_price,
+  // which eur_pln_price_conversion already handles on the Odoo side;
+  // this field is untouched by that module). Confirmed live in Odoo: a
+  // product correctly showing 799.17 zł Cost on General Information,
+  // right next to "187.16 PLN" on its own Purchase-tab vendor line — the
+  // same raw EUR number (187.16), just mislabeled as PLN.
+  //
+  // A first attempt at this fix (now reverted) added currency_id=EUR
+  // instead — technically accurate (Odoo would then genuinely know the
+  // line is EUR), but that's a DIFFERENT fix than what was actually
+  // wanted: it leaves the number itself in EUR, showing a mixed-currency
+  // Purchase tab (some lines EUR, some PLN) rather than one consistent
+  // currency across the whole product. What's actually wanted is the
+  // SAME numeric conversion already applied to cost_price/sale_price —
+  // multiply by the EUR->PLN rate and let it land in the company
+  // currency (PLN), same as those fields, with no currency_id override
+  // needed at all (product.supplierinfo defaults an unset currency_id to
+  // company currency automatically, exactly like product.template's
+  // price fields always have).
+  //
+  // Deliberately NOT touching ITscope's own supplierinfo lines here —
+  // their connector already sets real currency_id=EUR correctly on
+  // their own writes (confirmed via reading supplier_mixin.py), which is
+  // semantically correct as-is; this fix only changes what SYNCFLOW
+  // itself sends, same scoping principle used throughout this file
+  // (never edit or reach into ITscope's own write path).
+  //
+  // RATE RISK: this hardcodes the same 4.27 EUR_TO_PLN_RATE as the
+  // eur_pln_price_conversion Odoo module and AB.pl's own internal
+  // converter in syncEngine.js — now THREE places carrying this number
+  // independently, already a known documented risk between the first
+  // two; if the real rate is ever revisited, all three need updating
+  // together or vendor-line prices will drift out of sync with
+  // cost_price/sale_price on the same products.
+  const EUR_TO_PLN_RATE = 4.27;
 
   const templateIds = items.map(i => i.odoo_id).filter(Boolean);
   if (!templateIds.length) return { created: 0, updated: 0 };
@@ -785,16 +785,16 @@ async function syncVendorPricing(config, partnerId, items) {
 
   for (const item of items) {
     if (!item.odoo_id) continue;
-    const price = safeNumber(item.cost_price, 0);
+    // item.cost_price is Syncflow's canonical EUR value (see the
+    // no-conversion note in upsertBatch above) — converted to PLN here,
+    // same rate, same direction, as product.template's cost/sale prices.
+    const price = safeNumber(item.cost_price, 0) * EUR_TO_PLN_RATE;
     const supplierinfoId = existingByTemplateId[item.odoo_id];
 
     if (supplierinfoId) {
       toWrite.push({ supplierinfoId, price });
     } else {
-      toCreate.push({
-        partner_id: partnerId, product_tmpl_id: item.odoo_id, price, min_qty: 1,
-        ...(eurCurrencyId ? { currency_id: eurCurrencyId } : {}),
-      });
+      toCreate.push({ partner_id: partnerId, product_tmpl_id: item.odoo_id, price, min_qty: 1 });
     }
   }
 
@@ -810,7 +810,7 @@ async function syncVendorPricing(config, partnerId, items) {
       call(object, 'execute_kw', [
         config.database, uid, config.api_key,
         'product.supplierinfo', 'write',
-        [[supplierinfoId], { price, ...(eurCurrencyId ? { currency_id: eurCurrencyId } : {}) }]
+        [[supplierinfoId], { price }]
       ]).catch(e => {
         // NOTE (Aug 2026): this write only ever sends a plain number
         // (price) — no text field at all. If this fails with the SAME
